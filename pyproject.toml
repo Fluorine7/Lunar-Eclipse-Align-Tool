@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lunar-eclipse-align"
+dynamic = ["version"]
+description = "月食圆面对齐工具 - 用于处理月食照片的圆面对齐"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "正七价的氟离子" }]
+keywords = [
+    "lunar",
+    "eclipse",
+    "astronomy",
+    "image",
+    "processing",
+    "alignment",
+    "qt",
+    "pyside6",
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pyside6>=6.9.3",
+    "opencv-python>=4.12.0",
+    "numpy>=2.2",
+    "pillow>=11.2",
+    "psutil>=7.1.0",
+    "scipy>=1.16",
+    "scikit-image>=0.25.2",
+    "imagecodecs>=2025.8.2",
+]
+[project.optional-dependencies]
+test = [
+    "pytest>=8.4.2",
+    "pytest-qt>=4.5.0",
+    "pytest-cov>=7.0.0",
+    "pytest-env>=1.1.5",
+    "pyyaml>=6.0.3",
+    "pydantic>=2.0",
+]
+dev = ["pyinstaller>=6.16.0"]
+
+[project.scripts]
+lunar-eclipse-align = "lunar_eclipse_align.main:main"
+
+[tool.setuptools]
+packages = ["lunar_eclipse_align"]
+
+[tool.setuptools.package-data]
+lunar_eclipse_align = ["resources/*.jpg", "resources/*.png", "resources/*.jpeg"]
+
+
+# pytest 测试配置
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "--disable-warnings",
+    "--cov=src",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+    "--cov-report=xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+env = ["DEBUG=1"]
+
+# Coverage 配置
+[tool.coverage.run]
+source = ["lunar_eclipse_align"]
+omit = ["*/tests/*", "*/test_*", "setup.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]

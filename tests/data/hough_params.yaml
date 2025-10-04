@@ -1,0 +1,32 @@
+# Hough 圆检测参数配置
+# 每个参数集包含：描述、minRadius、maxRadius、param1、param2
+
+param_sets:
+  default:
+    description: "默认参数 - 用户未指定"
+    minRadius: 300
+    maxRadius: 800
+    param1: 50
+    param2: 30
+
+  bright_moon:
+    description: "明亮月亮 - 高边缘敏感度，减少噪声"
+    minRadius: 150
+    maxRadius: 315
+    param1: 80
+    param2: 25
+
+  dark_moon:
+    description: "暗淡月亮 - 低边缘敏感度，检测更多细节"
+    minRadius: 150
+    maxRadius: 315
+    param1: 30
+    param2: 20
+
+  basic:
+    description: "适用于basic/"
+    minRadius: 229
+    maxRadius: 253
+    param1: 30
+    param2: 35
+

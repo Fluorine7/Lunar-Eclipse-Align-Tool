@@ -1,0 +1,40 @@
+# 圆检测测试图像配置
+# 每个图像包含：路径、描述、默认参数、预期结果、容差
+
+images:
+  right-bottom:
+    path: "images/basic/DSC_3549.tif"
+    description: "右下角"
+    default_params: "basic"
+    expected_result:
+      x: 841.05
+      y: 717.14
+      radius: 241.76
+
+  deficient_edge_bad:
+    path: "images/deficient_edge/DSC_3571.tif"
+    description: "残边/左上角"
+    default_params: "basic"
+    expected_result:
+      x: 346.5
+      y: 341.5
+      radius: 242.2
+
+  deficient_edge_good:
+    path: "images/deficient_edge/DSC_3573.tif"
+    description: "残边"
+    default_params: "basic"
+    expected_result:
+      x: 346.5
+      y: 341.5
+      radius: 242.2
+
+  case2:
+    path: "images/basic/DSC_3563.tif"
+    default_params: "basic"
+    description: "右下角"
+    expected_result:
+      x: 859.5
+      y: 717.5
+      radius: 241.76
+
