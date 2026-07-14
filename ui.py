@@ -679,7 +679,23 @@ class PreviewWindow(tk.Toplevel):
         except Exception:
             det = None
 
-        # 若失败，退回一次轻量 Hough 尝试
+        # 调试接口不存在或失败时，使用与主处理流程相同的增强圆检测。
+        # 预览窗口原先直接退回单次 Hough；高曝光/接近饱和的样张容易因此漏检。
+        if not det or det.get('circle') is None:
+            try:
+                circle0, _processed0, _quality0, _method0, _brightness0 = _algo_circle.detect_circle_phd2_enhanced(
+                    small, min_r_s, max_r_s, p1, p2,
+                    strong_denoise=bool(self.strong_denoise_var.get())
+                )
+                if circle0 is not None:
+                    x0, y0, r0 = map(float, circle0[:3])
+                    # 手动框选提供了明确的位置先验；不接受远离框选的误检，继续走后备检测。
+                    if exp_cxcy is None or _np.hypot(x0 - exp_cxcy[0] / s, y0 - exp_cxcy[1] / s) <= center_tol_abs / s:
+                        det = {"circle": (x0, y0, r0), "method": _method0}
+            except Exception:
+                pass
+
+        # 增强检测仍失败时，最后退回一次轻量 Hough 尝试
         if not det or det.get('circle') is None:
             try:
                 gray = _cv2.cvtColor(small, _cv2.COLOR_BGR2GRAY) if small.ndim==3 else small
@@ -928,10 +944,9 @@ class UniversalLunarAlignApp:
         self.path_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,5))
         params_container = ttk.Frame(control); params_container.grid(row=1, column=0, columnspan=2, sticky="ew", pady=5)
         params_container.columnconfigure(0, weight=2); params_container.columnconfigure(1, weight=1)
-        self.param_frame = ttk.LabelFrame(params_container, text="2. PHD2霍夫圆参数", padding=10)
+        self.param_frame = ttk.LabelFrame(params_container, text="2. 月面圆检测参数", padding=10)
         self.param_frame.grid(row=0, column=0, sticky="nsew", padx=(0,5))
-        # 文案替换：IMPPG -> 多ROI精配准（保持控件结构不变）
-        self.imppg_frame = ttk.LabelFrame(params_container, text="3. 多ROI精配准", padding=10)
+        self.imppg_frame = ttk.LabelFrame(params_container, text="3. 实验性月面纹理微调", padding=10)
         self.imppg_frame.grid(row=0, column=1, sticky="nsew", padx=(5,0))
         self.debug_frame = ttk.LabelFrame(control, text="4. 预览与调试", padding=10)
         self.debug_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=5)
@@ -966,7 +981,7 @@ class UniversalLunarAlignApp:
 
     def _create_param_widgets(self):
         f = self.param_frame; f.columnconfigure(1, weight=1)
-        help_text = ("• PHD2增强算法：三级检测策略，自适应图像亮度\n"
+        help_text = ("• 霍夫圆检测结合外缘精定位，用于确定月面圆心\n"
                      "• 最小/最大半径: 限制检测到的圆的半径范围(像素)\n"
                      "• 参数1: Canny边缘检测高阈值\n"
                      "• 参数2: 霍夫累加器阈值（关键参数）")
@@ -981,22 +996,20 @@ class UniversalLunarAlignApp:
 
     def _create_imppg_widgets(self):
         f = self.imppg_frame
-        # 文案替换：启用IMPPG算法 -> 启用多ROI精配准
-        ttk.Checkbutton(f, text="启用多ROI精配准(仅支持赤道仪跟踪拍摄的素材)", variable=self.use_advanced_alignment,
+        ttk.Checkbutton(f, text="启用实验性月面纹理微调（仅平移）", variable=self.use_advanced_alignment,
                         command=self.on_advanced_change).pack(fill="x", padx=5, pady=(0,10))
-        # 文案替换：算法类型 -> 算法说明（保持 combobox，不影响 pipeline）
-        ttk.Label(f, text="算法说明:", font=UI_FONT).pack(anchor="w", padx=5)
+        ttk.Label(f, text="实验选项:", font=UI_FONT).pack(anchor="w", padx=5)
         self.method_combo = ttk.Combobox(f, textvariable=self.alignment_method,
                                          values=['auto','phase_corr','template','feature','centroid'],
                                          state="disabled", width=15, font=UI_FONT)
         self.method_combo.pack(fill="x", padx=5, pady=2)
         # 文案替换：算法帮助
-        algo_help = ("• 在月盘内自动选择多块ROI进行 ZNCC/相位相关微调\n"
-                     "• 对亮度变化与阴影边界更鲁棒，失败时自动回退到圆心对齐\n"
-                     "• 建议在偏食/生光阶段启用，多数情况默认关闭即可")
+        algo_help = ("• 在月盘内选择纹理区域，尝试对圆心结果做小幅平移微调\n"
+                     "• 受视宁、拖影、果冻效应及曝光变化影响，结果可能不稳定\n"
+                     "• 当前为实验功能；正式处理建议保持关闭")
         ttk.Label(f, text=algo_help, justify="left",
                   font=(UI_FONT[0], UI_FONT[1]-2), foreground="darkgreen").pack(anchor="w", padx=5, pady=(5,10))
-        ttk.Label(f, text="⚠️ 实验性功能，不推荐开启", font=(UI_FONT[0], UI_FONT[1]-1),
+        ttk.Label(f, text="⚠️ 实验性功能：默认关闭，不纳入常规对齐流程", font=(UI_FONT[0], UI_FONT[1]-1),
                   foreground="orange", justify="center").pack(pady=5)
 
     def _create_debug_widgets(self):
@@ -1054,7 +1067,7 @@ class UniversalLunarAlignApp:
         action_row.pack(fill="x", pady=10, padx=200)
         action_row.columnconfigure(0, weight=1)
         
-        self.start_button = ttk.Button(action_row, text="🚀 开始集成对齐", command=self.start_alignment)
+        self.start_button = ttk.Button(action_row, text="🚀 开始圆心对齐", command=self.start_alignment)
         self.start_button.grid(row=0, column=0, sticky="ew", ipady=8, padx=(0,10))
         
         try:
@@ -1076,21 +1089,21 @@ class UniversalLunarAlignApp:
 
     def _set_initial_log_message(self):
         scipy_status = "✓ 已安装" if SCIPY_AVAILABLE else "✗ 未安装"
-        welcome = (f"欢迎使用月食圆面对齐工具 V{VERSION} - 集成版 By @正七价的氟离子\n"
+        welcome = (f"欢迎使用月食圆面对齐工具 V{VERSION} By @正七价的氟离子\n"
                    f"运行平台: {SYSTEM}\n"
                    f"SciPy状态: {scipy_status}\n"
                    "================================================================\n\n"
                    "算法说明：\n"
-                   "• PHD2增强算法：基于霍夫圆检测，适用于完整清晰的月球\n"
-                   "• 多ROI精配准：适用于偏食、生光等复杂阶段（实验性）\n"
-                   "• 回退机制：确保在任何情况下都有可用的对齐方案\n\n"
+                   "• 常规流程：霍夫圆检测 + 月面外缘精定位，以圆心进行仅平移对齐\n"
+                   "• 实验性月面纹理微调：默认关闭，不建议用于常规处理\n"
+                   "• 不进行图像缩放或旋转\n\n"
                    "使用建议：\n"
                    "• 使用预览工具准确估算半径范围\n"
                    "• 参数2（累加器阈值）是最关键的调整参数\n"
                    f"• 支持格式：{', '.join(SUPPORTED_EXTS)}\n")
         if not SCIPY_AVAILABLE:
             welcome += ("\n⚠️ 注意: SciPy未安装，相位相关算法将被禁用\n"
-                        "可通过 pip install scipy 安装以启用多ROI中的相位相关增强\n")
+                        "可通过 pip install scipy 安装以启用实验性纹理微调中的相位相关增强\n")
         self.log_box.insert(tk.END, welcome); self.log_box.config(state="disabled")
 
     # —— 选择/打开等 UI 行为（保持原文案） ——
@@ -1099,7 +1112,7 @@ class UniversalLunarAlignApp:
         if path:
             path = normalize_path(path); self.input_var.set(path)
             parent = os.path.dirname(path); name = os.path.basename(path)
-            self.output_var.set(safe_join(parent, f"{name}_aligned_v12b"))
+            self.output_var.set(safe_join(parent, f"{name}_aligned_V130b"))
 
     def select_output_folder(self):
         path = filedialog.askdirectory(title="选择输出文件夹")
@@ -1149,7 +1162,7 @@ class UniversalLunarAlignApp:
         use_advanced = self.use_advanced_alignment.get()
         method = self.alignment_method.get()
         if use_advanced and not SCIPY_AVAILABLE and method in ['auto','phase_corr']:
-            ok = messagebox.askyesno("警告","SciPy未安装，相位相关算法将被禁用。\n多ROI精配准的相位相关增强可能受限。\n\n是否继续？", icon='warning')
+            ok = messagebox.askyesno("警告","SciPy未安装，相位相关算法将被禁用。\n实验性月面纹理微调的效果可能受限。\n\n是否继续？", icon='warning')
             if not ok: return
 
         ref_path = self.reference_image_var.get().strip() or None
@@ -1176,11 +1189,17 @@ class UniversalLunarAlignApp:
         self.log_box.config(state="normal"); self.log_box.delete(1.0, tk.END)
         # 文案替换：按钮状态文本
         self.start_button.config(state="disabled",
-            text=("集成对齐中 (多ROI + PHD2)..." if use_advanced else "PHD2对齐中..."))
+            text=("圆心对齐中（含实验性纹理微调）..." if use_advanced else "圆心对齐中..."))
         pw = self.show_progress_window()
 
         def progress_callback(pct, status):
-            if pw and pw.winfo_exists(): pw.update_progress(pct, status)
+            # Tkinter widgets may only be touched by the main thread. The
+            # alignment pipeline runs in a worker, so marshal every progress
+            # update through the event loop instead of calling Tk directly.
+            def update_progress():
+                if pw and pw.winfo_exists():
+                    pw.update_progress(pct, status)
+            self.root.after(0, update_progress)
 
         import threading
         threading.Thread(
@@ -1195,7 +1214,7 @@ class UniversalLunarAlignApp:
         self.root.after(0, lambda: self._update_ui_on_complete(success, message))
 
     def _update_ui_on_complete(self, success, message):
-        self.start_button.config(state="normal", text="🚀 开始集成对齐")
+        self.start_button.config(state="normal", text="🚀 开始圆心对齐")
         self.log_box.config(state="disabled")
         if self.progress_window and self.progress_window.winfo_exists():
             self.progress_window.destroy(); self.progress_window = None

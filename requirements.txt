@@ -2,6 +2,7 @@
 opencv-python
 numpy
 pillow
+tifffile>=2024.0.0  # 16-bit TIFF output with embedded ICC profile
 psutil
 
 #打包

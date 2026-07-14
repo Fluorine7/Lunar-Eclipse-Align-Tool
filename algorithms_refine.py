@@ -242,7 +242,7 @@ def refine_alignment_multi_roi(
     输入：已做圆心粗配准的 ref_gray / tgt_gray，以及参考圆心(cx,cy)与半径 r
     输出：(M2x3, score, n_inliers, theta_deg)
     特性：
-      • 仅估计 旋转+平移（无缩放），绕 (cx,cy) 旋转
+      • 仅估计残余平移（无旋转、无缩放）
       • ROI 只在局部窗口内做匹配，避免全图卷积导致卡顿
       • 内置时间预算，个别困难帧自动提前结束并回退上层策略
       • 过滤过暗/低纹理 ROI，提升稳健性
@@ -251,7 +251,7 @@ def refine_alignment_multi_roi(
     """
     H, W = ref_gray.shape
     _dbg(f"[Refine] HxW={H}x{W}, r≈{r:.1f}, n_rois={n_rois}, roi_init={roi_size}, search={search}", debug_cb)
-    _dbg(f"[Refine] 启用自适应ROI与亮度门控: brightness∈[30,220]", debug_cb)
+    _dbg("[Refine] 使用盘内纹理 ROI；不使用绝对亮度门控", debug_cb)
 
     # 软盘遮罩，仅保留月盘内纹理
     mask = _soft_disk_mask(H, W, cx, cy, r, inner=0.0, outer=0.97)
@@ -280,7 +280,8 @@ def refine_alignment_multi_roi(
     roi_size = int(np.clip(roi_size if roi_size else (r*0.12), 64, 128))
     search = int(np.clip(search if search else (r*0.05), 6, 18))
 
-    rois = _select_rois(energy, mask, r, k=n_rois, box=roi_size, ref_img=ref_gray_8u)
+    # 月食阶段亮度可跨很大范围；只依据盘内高频纹理选块，不以绝对灰度排除 ROI。
+    rois = _select_rois(energy, mask, r, k=n_rois, box=roi_size)
     _dbg(f"[Refine] ROI候选数={len(rois)}", debug_cb)
     sizes = [bw for (_sc, _x, _y, bw, bh) in rois]
     if sizes:
@@ -308,9 +309,8 @@ def refine_alignment_multi_roi(
             _dbg(f"[Refine] 丢弃ROI: 过暗/低纹理 mean={m:.1f}, std={s:.1f}", debug_cb)
             continue
 
-        bmin, bmax = 30, 220
-        ref_block8 = ref_gray_8u[y:y + bh, x:x + bw]
-        mask_patch = ((ref_block8 >= bmin) & (ref_block8 <= bmax)).astype(np.uint8) * 255
+        # 几何月盘遮罩，而非绝对亮度遮罩：阴影中的有效地形不应被误删。
+        mask_patch = (mask[y:y + bh, x:x + bw] > 0.5).astype(np.uint8) * 255
         if mask_patch.size > 0:
             mask_patch = cv2.erode(mask_patch, np.ones((3,3), np.uint8), iterations=1)
 
@@ -327,9 +327,10 @@ def refine_alignment_multi_roi(
         # 可选：相位相关做亚像素微调（仅在纹理足够时启用）
         if use_phasecorr:
             h, w = ref_patch.shape
-            cxp = int(x + w/2); cyp = int(y + h/2)
-            xp = max(0, cxp - w//2 - search)
-            yp = max(0, cyp - h//2 - search)
+            # ZNCC 已给出整数峰值；在该峰值位置取同尺寸目标块，再仅估计
+            # 亚像素残差，不能从原始位置重复估计整段位移。
+            xp = int(round(x + dx))
+            yp = int(round(y + dy))
             xe = min(tgtF.shape[1], xp + w)
             ye = min(tgtF.shape[0], yp + h)
             tgt_patch = tgtF[yp:ye, xp:xe]
@@ -366,7 +367,7 @@ def refine_alignment_multi_roi(
             tx_h, ty_h = float(base_shift[0]), float(base_shift[1])
             M_h = np.array([[1.0, 0.0, tx_h],
                             [0.0, 1.0, ty_h]], dtype=np.float32)
-            _dbg(f"[Refine] ROI不足，回退霍夫: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
+            _dbg(f"[Refine] ROI不足，回退粗对齐残差: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
             return M_h, 0.0, 0, 0.0
         return None, 0.0, 0, 0.0
 
@@ -402,7 +403,7 @@ def refine_alignment_multi_roi(
             tx_h, ty_h = float(base_shift[0]), float(base_shift[1])
             M_h = np.array([[1.0, 0.0, tx_h],
                             [0.0, 1.0, ty_h]], dtype=np.float32)
-            _dbg(f"[Refine] IRLS失败，回退霍夫: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
+            _dbg(f"[Refine] IRLS失败，回退粗对齐残差: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
             return M_h, 0.0, 0, 0.0
         return None, 0.0, 0, 0.0
 
@@ -428,9 +429,9 @@ def refine_alignment_multi_roi(
             bad = True
             reasons.append(f"|refine-hough|={delta:.2f}px>{float(max_refine_delta_px):.2f}")
         if bad:
-            # Fall back to Hough baseline shift
+            # Fall back to the residual baseline (normally identity after coarse alignment).
             tx, ty = dx_h, dy_h
-            _dbg("[Refine] 触发门控，回退霍夫: " + "; ".join(reasons) + f" -> ({tx:.2f},{ty:.2f})", debug_cb)
+            _dbg("[Refine] 触发门控，回退粗对齐残差: " + "; ".join(reasons) + f" -> ({tx:.2f},{ty:.2f})", debug_cb)
 
     # 最终 2x3 仿射矩阵（仅平移）
     M = np.array([[1.0, 0.0, tx],

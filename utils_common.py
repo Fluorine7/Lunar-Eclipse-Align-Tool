@@ -15,7 +15,7 @@ IS_WINDOWS = SYSTEM == "Windows"
 IS_MACOS = SYSTEM == "Darwin"
 IS_LINUX = SYSTEM == "Linux"
 
-VERSION = "1.2.0-beta"
+VERSION = "1.3.0-beta"
 DEFAULT_DEBUG_MODE = False
 DEFAULT_DEBUG_IMAGE_PATH = ""
 SUPPORTED_EXTS = {'.tif', '.tiff', '.bmp', '.png', '.jpg', '.jpeg'}
@@ -148,18 +148,6 @@ def imwrite_with_exif(src_path, dst_path, img_bgr):
         if ext not in (".jpg", ".jpeg", ".tif", ".tiff"):
             return imwrite_unicode(dst_path, img_bgr)
 
-        # Pillow 不可用则直接回退
-        if Image is None:
-            return imwrite_unicode(dst_path, img_bgr)
-
-        # BGR -> RGB
-        try:
-            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        except Exception:
-            # 如果颜色转换失败，仍尝试直接构建
-            rgb = img_bgr
-        im = Image.fromarray(rgb)
-
         exif_bytes = None
         icc = None
         # 读取源图的 EXIF 与 ICC
@@ -167,32 +155,52 @@ def imwrite_with_exif(src_path, dst_path, img_bgr):
             with Image.open(src_path) as src_im:
                 exif_bytes = src_im.info.get("exif", None)
                 icc = src_im.info.get("icc_profile", None)
-                # 将 Orientation 归一到 1，避免查看器再次旋转
                 if exif_bytes and piexif is not None:
                     try:
                         exif_dict = piexif.load(exif_bytes)
                         exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
                         exif_bytes = piexif.dump(exif_dict)
                     except Exception:
-                        # EXIF 解析失败则保持原样
                         pass
         except Exception:
             pass
 
+        # Pillow cannot reliably encode RGB uint16 TIFF arrays. Use tifffile
+        # for that path so Canon 16-bit TIFFs retain both their bit depth and
+        # the embedded ICC profile (TIFF tag 34675).
+        if ext in (".tif", ".tiff") and img_bgr.dtype == np.uint16:
+            try:
+                import tifffile
+                if img_bgr.ndim == 3 and img_bgr.shape[2] == 3:
+                    output, photometric = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), "rgb"
+                elif img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
+                    output, photometric = cv2.cvtColor(img_bgr, cv2.COLOR_BGRA2RGBA), "rgb"
+                else:
+                    output, photometric = img_bgr, "minisblack"
+                extra_tags = [(34675, "B", len(icc), icc, False)] if icc else []
+                tifffile.imwrite(dst_path, output, photometric=photometric,
+                                 compression=None, metadata=None, extratags=extra_tags)
+                return True
+            except Exception:
+                pass
+
+        if Image is None:
+            return imwrite_unicode(dst_path, img_bgr)
+        try:
+            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        except Exception:
+            rgb = img_bgr
+        im = Image.fromarray(rgb)
         save_kwargs = {}
         if exif_bytes is not None:
             save_kwargs["exif"] = exif_bytes
         if icc is not None:
             save_kwargs["icc_profile"] = icc
-
         if ext in (".jpg", ".jpeg"):
-            # 设一个较高质量，保持文件体积与质量平衡
             save_kwargs.setdefault("quality", 95)
-            im.save(dst_path, **save_kwargs)
-        else:  # TIFF
-            # 无损/轻压缩
+        else:
             save_kwargs.setdefault("compression", "tiff_deflate")
-            im.save(dst_path, **save_kwargs)
+        im.save(dst_path, **save_kwargs)
         return True
     except Exception:
         # 任意异常回退

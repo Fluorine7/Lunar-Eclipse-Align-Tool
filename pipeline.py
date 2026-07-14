@@ -3,11 +3,12 @@ import cv2, numpy as np
 
 from utils_common import (
     log, normalize_path, ensure_dir_exists, safe_join,
-    imread_unicode, imwrite_unicode, get_memory_usage_mb,
+    imread_unicode, imwrite_unicode, imwrite_with_exif, get_memory_usage_mb,
     force_garbage_collection, MemoryManager, SUPPORTED_EXTS, VERSION
 )
 
 from algorithms_circle import detect_circle_phd2_enhanced, masked_phase_corr
+from algorithms_limb import refine_lunar_limb
 
 # refine 返回可能是 (M, score, nin) 也可能是 (M, theta_deg, score, nin)
 from algorithms_refine import refine_alignment_multi_roi  # 兼容旧/新签名
@@ -167,7 +168,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         log(f"月食圆面对齐工具 V{VERSION} - 增量处理版", log_box)
         log(f"处理模式: 增量处理 (边检测边保存)", log_box)
         log(f"文件总数: {total_files}", log_box)
-        log(f"多ROI精配准: {'启用' if use_advanced_alignment else '禁用'}", log_box)
+        log(f"实验性月面纹理微调: {'启用' if use_advanced_alignment else '关闭（常规流程）'}", log_box)
         log("=" * 60, log_box)
 
         # 参考图像
@@ -247,6 +248,25 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         if reference_image is None:
             raise Exception("无法找到有效的参考图像，请检查图像质量和参数设置")
 
+        # Refine the reference limb. Each target frame is fitted independently:
+        # exposure, seeing and focus can alter the measured edge radius. The
+        # fitted radius is only for locating its center; output is never scaled.
+        ref_limb = refine_lunar_limb(
+            reference_image,
+            (float(reference_center[0]), float(reference_center[1]), float(reference_radius)),
+        )
+        if ref_limb is not None:
+            ref_circle, ref_rms, ref_coverage, ref_points = ref_limb
+            reference_center = (ref_circle[0], ref_circle[1])
+            reference_radius = ref_circle[2]
+            log(
+                f"✓ 外缘精定位参考图: center=({ref_circle[0]:.2f}, {ref_circle[1]:.2f}), "
+                f"r={ref_circle[2]:.2f}, RMS={ref_rms:.2f}px, coverage={ref_coverage:.0%}, n={ref_points}",
+                log_box,
+            )
+        else:
+            log("⚠ 参考图外缘精定位失败，保留霍夫圆结果。", log_box)
+
         log(f"🎯 最终参考图像: {reference_filename}, 质量评分={best_quality:.1f}", log_box)
 
         # 处理所有图像
@@ -272,7 +292,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 # 参考图：直接另存
                 if filename == reference_filename:
                     output_path = safe_join(output_folder, f"aligned_{filename}")
-                    if imwrite_unicode(output_path, reference_image):
+                    if imwrite_with_exif(input_path, output_path, reference_image):
                         success_count += 1
                         log(f"  🎯 {filename}: [参考图像] 已保存", log_box)
                         if debug_mode and filename == debug_image_basename:
@@ -302,6 +322,32 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     log(f"  ✗ {filename}: 圆检测失败(耗时 {dt_det:.2f}s)", log_box)
                     failed_files.append(filename); del target_image; continue
 
+                limb_used = False
+                # Do not lock the target radius to the reference radius. It is
+                # an edge-detection fit only (not an image scale transform), and
+                # lets differently exposed/apparent-size frames find their own
+                # lunar center.
+                limb = refine_lunar_limb(target_image, circle)
+                # A failed Hough/RANSAC candidate can occasionally be far from
+                # the real disk. For continuous captures, retry from the last
+                # accepted limb before accepting the low-confidence fallback.
+                if limb is None and last_circle is not None:
+                    limb = refine_lunar_limb(target_image, last_circle, search_px=64)
+                if limb is not None:
+                    limb_circle, limb_rms, limb_coverage, limb_points = limb
+                    circle = np.asarray(limb_circle, dtype=np.float32)
+                    method = f"{method} + 外缘精定位"
+                    quality = max(float(quality), 100.0 / (1.0 + limb_rms))
+                    limb_used = True
+                    log(
+                        f"    [Limb] center=({limb_circle[0]:.2f}, {limb_circle[1]:.2f}), "
+                        f"r={limb_circle[2]:.2f}px, RMS={limb_rms:.2f}px, "
+                        f"coverage={limb_coverage:.0%}, n={limb_points}",
+                        log_box,
+                    )
+                else:
+                    log("    [Limb] 外缘精定位不可靠，保留霍夫圆结果。", log_box)
+
                 brightness_stats[brightness] += 1
                 method_stats[method] = method_stats.get(method, 0) + 1
 
@@ -311,7 +357,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 shift_x = reference_center[0] - target_center[0]
                 shift_y = reference_center[1] - target_center[1]
                 confidence = max(0.30, min(0.98, quality / 100.0))
-                align_method = "Circle Center"
+                align_method = "外缘圆心对齐" if limb_used else "霍夫圆心对齐"
                 theta_deg = 0.0
 
                 rows, cols = target_image.shape[:2]
@@ -320,7 +366,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                                          flags=cv2.INTER_LANCZOS4,
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-                # 多 ROI 精配准（仅平移，无旋转）
+                # 实验性月面纹理微调（仅残余平移；常规流程默认关闭）
                 try:
                     if reference_radius is not None and use_advanced_alignment:
                         ref_gray = reference_image if reference_image.ndim==2 else cv2.cvtColor(reference_image, cv2.COLOR_BGR2GRAY)
@@ -335,8 +381,11 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                             float(reference_radius),
                             n_rois=16, roi_size=roi_size, search=12,
                             use_phasecorr=True, use_ecc=False,
-                            base_shift=(float(shift_x), float(shift_y)),
-                            max_refine_delta_px=max_refine_delta_px
+                            # `aligned` 已经应用了霍夫圆心平移；ROI 输出和
+                            # 回退基线都必须处于残余坐标系，不能再次应用 shift。
+                            base_shift=(0.0, 0.0),
+                            max_refine_delta_px=max_refine_delta_px,
+                            debug_cb=(lambda msg: log(f"    {msg}", log_box)) if debug_mode else (lambda msg: None),
                         )
                         dt_refine = time.time() - t_refine
                         M2, theta_deg, score, nin = _unpack_refine_result(res)
@@ -358,44 +407,20 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0
                             )
                             confidence = max(confidence, float(score))
-                            align_method = f"Multi-ROI refine (仅平移, inliers={nin}, roi_init≈{roi_used}, Δ={residual:.2f}px, gate≤{max_refine_delta_px:.0f}px, {dt_refine:.2f}s)"
+                            align_method = f"外缘圆心对齐 + 实验性纹理微调（仅平移, inliers={nin}, roi_init≈{roi_used}, Δ={residual:.2f}px, gate≤{max_refine_delta_px:.0f}px, {dt_refine:.2f}s)"
                         else:
-                            log("    [Refine] 无有效解，回退 Masked PhaseCorr", log_box)
-                            # 遮罩相位相关微调（仅平移）
-                            t_pc = time.time()
-                            dx2, dy2 = masked_phase_corr(
-                                ref_gray, tgt_gray2,
-                                float(reference_center[0]), float(reference_center[1]),
-                                float(reference_radius)
-                            )
-                            dt_pc = time.time() - t_pc
-                            if abs(dx2)>1e-3 or abs(dy2)>1e-3:
-                                M2 = np.float32([[1,0,dx2],[0,1,dy2]])
-                                aligned = cv2.warpAffine(aligned, M2, (cols, rows),
-                                                         flags=cv2.INTER_LANCZOS4,
-                                                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                                align_method = f"Masked PhaseCorr ({dt_pc:.2f}s)"
-                    elif reference_radius is not None:
-                        # 未启用高级：遮罩相位相关微调
-                        ref_gray = reference_image if reference_image.ndim==2 else cv2.cvtColor(reference_image, cv2.COLOR_BGR2GRAY)
-                        tgt_gray2 = aligned if aligned.ndim==2 else cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
-                        dx2, dy2 = masked_phase_corr(
-                            ref_gray, tgt_gray2,
-                            float(reference_center[0]), float(reference_center[1]),
-                            float(reference_radius)
-                        )
-                        if abs(dx2)>1e-3 or abs(dy2)>1e-3:
-                            M2 = np.float32([[1,0,dx2],[0,1,dy2]])
-                            aligned = cv2.warpAffine(aligned, M2, (cols, rows),
-                                                     flags=cv2.INTER_LANCZOS4,
-                                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                            align_method = "Masked PhaseCorr"
+                            # Eclipse illumination changes make a rejected ROI
+                            # solution safer than a blind phase-correlation
+                            # fallback. Keep the independently validated limb
+                            # transform instead of introducing frame-to-frame
+                            # jitter from lunar-surface texture.
+                            log("    [纹理微调] 无有效解，保留外缘圆心对齐。", log_box)
                 except Exception as e:
                     log(f"    [Refine异常] {filename}: {e}", log_box)
 
                 # 保存
                 out_path = safe_join(output_folder, f"aligned_{filename}")
-                if imwrite_unicode(out_path, aligned):
+                if imwrite_with_exif(input_path, out_path, aligned):
                     success_count += 1
                     # 更新上一帧先验
                     try:
@@ -430,7 +455,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         log("=" * 60, log_box)
         log(f"增量对齐完成! 成功对齐 {success_count}/{total_files} 张图像", log_box)
         log(f"使用参考图像: {reference_filename}", log_box)
-        log(f"对齐算法: {'多ROI精配准（仅平移）' if use_advanced_alignment else 'PHD2圆心算法'}", log_box)
+        log(f"对齐流程: {'外缘圆心对齐 + 实验性纹理微调（仅平移）' if use_advanced_alignment else '霍夫圆检测 + 外缘圆心对齐（仅平移）'}", log_box)
         if failed_files:
             head = ', '.join(failed_files[:5]) + ("..." if len(failed_files)>5 else "")
             log(f"失败文件({len(failed_files)}): {head}", log_box)
