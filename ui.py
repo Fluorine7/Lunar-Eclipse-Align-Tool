@@ -1094,7 +1094,8 @@ class UniversalLunarAlignApp:
                    f"SciPy状态: {scipy_status}\n"
                    "================================================================\n\n"
                    "算法说明：\n"
-                   "• 常规流程：霍夫圆检测 + 月面外缘精定位，以圆心进行仅平移对齐\n"
+                   "• 常规流程：霍夫初定位 + 受约束椭圆/稳健圆外缘精定位\n"
+                   "• 每张目标图独立求圆心；短月缘使用参考图半径约束\n"
                    "• 实验性月面纹理微调：默认关闭，不建议用于常规处理\n"
                    "• 不进行图像缩放或旋转\n\n"
                    "使用建议：\n"
@@ -1112,7 +1113,7 @@ class UniversalLunarAlignApp:
         if path:
             path = normalize_path(path); self.input_var.set(path)
             parent = os.path.dirname(path); name = os.path.basename(path)
-            self.output_var.set(safe_join(parent, f"{name}_aligned_V130b"))
+            self.output_var.set(safe_join(parent, f"{name}_aligned_V140b"))
 
     def select_output_folder(self):
         path = filedialog.askdirectory(title="选择输出文件夹")

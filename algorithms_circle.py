@@ -110,9 +110,12 @@ def _fit_circle_ransac(points, iterations=120, threshold=2.0, min_inliers=40):
     best_circle = None
     best_inliers = 0
     N = len(points)
+    # A fixed local generator makes one frame reproducible regardless of which
+    # files were processed before it. Never consume NumPy's process-global RNG.
+    rng = np.random.default_rng(0)
     for _ in range(iterations):
         try:
-            idx = np.random.choice(N, 3, replace=False)
+            idx = rng.choice(N, 3, replace=False)
         except ValueError:
             return None
         tri = points[idx]

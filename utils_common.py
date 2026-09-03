@@ -15,7 +15,7 @@ IS_WINDOWS = SYSTEM == "Windows"
 IS_MACOS = SYSTEM == "Darwin"
 IS_LINUX = SYSTEM == "Linux"
 
-VERSION = "1.3.0-beta"
+VERSION = "1.4.0-beta"
 DEFAULT_DEBUG_MODE = False
 DEFAULT_DEBUG_IMAGE_PATH = ""
 SUPPORTED_EXTS = {'.tif', '.tiff', '.bmp', '.png', '.jpg', '.jpeg'}

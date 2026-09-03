@@ -3,7 +3,7 @@ import os, sys, platform, shutil
 from PyInstaller.__main__ import run
 from PyInstaller.utils.hooks import collect_data_files
 
-APP_NAME = "Lunar_Eclipse_Align_Tool"
+APP_NAME = "Lunar_Eclipse_Align_Tool_V140b"
 ENTRY = "main.py"
 
 def sep():

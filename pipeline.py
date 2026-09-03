@@ -8,7 +8,7 @@ from utils_common import (
 )
 
 from algorithms_circle import detect_circle_phd2_enhanced, masked_phase_corr
-from algorithms_limb import refine_lunar_limb
+from algorithms_limb import refine_lunar_limb, refine_lunar_limb_elliptical
 
 # refine 返回可能是 (M, score, nin) 也可能是 (M, theta_deg, score, nin)
 from algorithms_refine import refine_alignment_multi_roi  # 兼容旧/新签名
@@ -248,19 +248,21 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         if reference_image is None:
             raise Exception("无法找到有效的参考图像，请检查图像质量和参数设置")
 
-        # Refine the reference limb. Each target frame is fitted independently:
-        # exposure, seeing and focus can alter the measured edge radius. The
-        # fitted radius is only for locating its center; output is never scaled.
-        ref_limb = refine_lunar_limb(
+        # Refine the reference limb. Its radius supplies the missing scale
+        # constraint when one target contains only a short illuminated arc.
+        # Every target center is still solved independently and output is never
+        # scaled or linked to another target frame.
+        ref_limb = refine_lunar_limb_elliptical(
             reference_image,
             (float(reference_center[0]), float(reference_center[1]), float(reference_radius)),
         )
         if ref_limb is not None:
-            ref_circle, ref_rms, ref_coverage, ref_points = ref_limb
+            ref_circle, ref_rms, ref_coverage, ref_points, ref_shape, ref_shape_updated = ref_limb
             reference_center = (ref_circle[0], ref_circle[1])
             reference_radius = ref_circle[2]
+            ref_model = "受约束椭圆" if ref_shape is not None else "稳健圆"
             log(
-                f"✓ 外缘精定位参考图: center=({ref_circle[0]:.2f}, {ref_circle[1]:.2f}), "
+                f"✓ 外缘精定位参考图({ref_model}): center=({ref_circle[0]:.2f}, {ref_circle[1]:.2f}), "
                 f"r={ref_circle[2]:.2f}, RMS={ref_rms:.2f}px, coverage={ref_coverage:.0%}, n={ref_points}",
                 log_box,
             )
@@ -277,11 +279,6 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
 
         # 为速度统计
         t_all0 = time.time()
-
-        # 以参考图圆作为先验，后续逐帧更新
-        last_circle = None
-        if reference_center is not None and reference_radius is not None:
-            last_circle = (float(reference_center[0]), float(reference_center[1]), float(reference_radius))
 
         for i, filename in enumerate(image_files):
             if progress_callback:
@@ -314,7 +311,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 t_det = time.time()
                 circle, processed, quality, method, brightness = detect_circle_phd2_enhanced(
                     target_image, min_rad, max_rad, param1, param2,
-                    strong_denoise=strong_denoise, prev_circle=last_circle
+                    strong_denoise=strong_denoise, prev_circle=None
                 )
                 dt_det = time.time() - t_det
 
@@ -323,26 +320,51 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     failed_files.append(filename); del target_image; continue
 
                 limb_used = False
-                # Do not lock the target radius to the reference radius. It is
-                # an edge-detection fit only (not an image scale transform), and
-                # lets differently exposed/apparent-size frames find their own
-                # lunar center.
-                limb = refine_lunar_limb(target_image, circle)
-                # A failed Hough/RANSAC candidate can occasionally be far from
-                # the real disk. For continuous captures, retry from the last
-                # accepted limb before accepting the low-confidence fallback.
-                if limb is None and last_circle is not None:
-                    limb = refine_lunar_limb(target_image, last_circle, search_px=64)
+                # Every target is solved independently. No previous-frame
+                # center, radius, or ellipse shape is allowed into this fit.
+                limb = refine_lunar_limb_elliptical(target_image, circle)
                 if limb is not None:
-                    limb_circle, limb_rms, limb_coverage, limb_points = limb
+                    limb_circle, limb_rms, limb_coverage, limb_points, limb_shape, shape_updated = limb
+                    radius_constrained = False
+                    # A short visible arc cannot independently determine both
+                    # radius and center. Use the fixed reference radius as the
+                    # missing batch-level scale constraint; this is still a
+                    # target-to-reference solve and never reads another target.
+                    if (
+                        limb_shape is None
+                        and limb_coverage < 0.42
+                        and reference_radius is not None
+                    ):
+                        fixed_limb = refine_lunar_limb(
+                            target_image,
+                            limb_circle,
+                            fixed_radius=float(reference_radius),
+                            search_px=32,
+                        )
+                        if fixed_limb is not None:
+                            fixed_circle, fixed_rms, fixed_coverage, fixed_points = fixed_limb
+                            if fixed_rms <= 3.5:
+                                limb_circle = fixed_circle
+                                limb_rms = fixed_rms
+                                limb_coverage = fixed_coverage
+                                limb_points = fixed_points
+                                radius_constrained = True
                     circle = np.asarray(limb_circle, dtype=np.float32)
-                    method = f"{method} + 外缘精定位"
+                    ellipse_used = limb_shape is not None and shape_updated
+                    if ellipse_used:
+                        limb_model = "单帧受约束椭圆"
+                    elif radius_constrained:
+                        limb_model = "参考半径约束圆"
+                    else:
+                        limb_model = "单帧稳健圆"
+                    method = f"{method} + 外缘精定位({limb_model})"
                     quality = max(float(quality), 100.0 / (1.0 + limb_rms))
                     limb_used = True
                     log(
-                        f"    [Limb] center=({limb_circle[0]:.2f}, {limb_circle[1]:.2f}), "
+                        f"    [Limb:{limb_model}] center=({limb_circle[0]:.2f}, {limb_circle[1]:.2f}), "
                         f"r={limb_circle[2]:.2f}px, RMS={limb_rms:.2f}px, "
-                        f"coverage={limb_coverage:.0%}, n={limb_points}",
+                        f"coverage={limb_coverage:.0%}, n={limb_points}, "
+                        f"shape={'independent' if shape_updated else 'circle-fallback'}",
                         log_box,
                     )
                 else:
@@ -422,11 +444,6 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 out_path = safe_join(output_folder, f"aligned_{filename}")
                 if imwrite_with_exif(input_path, out_path, aligned):
                     success_count += 1
-                    # 更新上一帧先验
-                    try:
-                        last_circle = (float(circle[0]), float(circle[1]), float(circle[2]))
-                    except Exception:
-                        pass
                     log(f"  ✓ {filename}: 偏移=({shift_x:.1f},{shift_y:.1f}), "
                         f"质量={quality:.1f}, 置信度={confidence:.3f}, 圆检耗时={dt_det:.2f}s, 读取={dt_read:.2f}s | {align_method}", log_box)
 
@@ -455,7 +472,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         log("=" * 60, log_box)
         log(f"增量对齐完成! 成功对齐 {success_count}/{total_files} 张图像", log_box)
         log(f"使用参考图像: {reference_filename}", log_box)
-        log(f"对齐流程: {'外缘圆心对齐 + 实验性纹理微调（仅平移）' if use_advanced_alignment else '霍夫圆检测 + 外缘圆心对齐（仅平移）'}", log_box)
+        log(f"对齐流程: {'受约束椭圆/稳健圆外缘 + 实验性纹理微调（仅平移）' if use_advanced_alignment else '霍夫初定位 + 受约束椭圆/稳健圆外缘对齐（仅平移）'}", log_box)
         if failed_files:
             head = ', '.join(failed_files[:5]) + ("..." if len(failed_files)>5 else "")
             log(f"失败文件({len(failed_files)}): {head}", log_box)
