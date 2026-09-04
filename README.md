@@ -108,4 +108,8 @@ PyInstaller 输出文件名为 `Lunar_Eclipse_Align_Tool_V150b`，生成在 `dis
 
 ## 许可证
 
-本项目使用 [MIT License](LICENSE)。
+Copyright © 2025–2026 Fluorine Zhu。
+
+本项目从 V1.5.0-beta 起采用 [GNU General Public License v3.0 only](LICENSE)（SPDX：`GPL-3.0-only`）。如果分发本项目的修改版或基于本项目形成的衍生程序，必须依照 GPLv3 向接收者提供对应源代码及同等许可权利；不得将其作为闭源专有软件重新发布。
+
+项目使用的第三方库及资源仍分别适用其各自的许可证。
