@@ -5,6 +5,7 @@ import numpy as np
 
 from algorithms_limb import (
     detect_faint_lunar_disk,
+    prepare_lunar_limb_image,
     refine_lunar_limb,
     refine_lunar_limb_elliptical,
 )
@@ -72,6 +73,21 @@ class ConstrainedEllipseLimbTests(unittest.TestCase):
         self.assertAlmostEqual(fitted[2], 246.0)
         self.assertLess(abs(fitted[0] - center[0]), 2.0)
         self.assertLess(abs(fitted[1] - center[1]), 2.0)
+
+    def test_prepared_analysis_image_preserves_fit_result(self):
+        center = (410.0, 391.0)
+        image = synthetic_partial_moon(center, (250.0, 242.0), center[0] - 55.0)
+        initial = (407.0, 395.0, 247.0)
+
+        direct = refine_lunar_limb_elliptical(image, initial)
+        reused = refine_lunar_limb_elliptical(
+            image, initial, prepared_gray=prepare_lunar_limb_image(image),
+        )
+
+        self.assertIsNotNone(direct)
+        self.assertIsNotNone(reused)
+        np.testing.assert_allclose(direct[0], reused[0], atol=1e-9, rtol=0.0)
+        self.assertEqual(direct[4:], reused[4:])
 
 
 class FaintLimbFallbackTests(unittest.TestCase):

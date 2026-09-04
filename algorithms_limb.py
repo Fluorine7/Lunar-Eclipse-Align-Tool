@@ -187,6 +187,11 @@ def _quadratic_peak_offset(values: np.ndarray) -> float:
     return float(np.clip(0.5 * (left - right) / denominator, -0.75, 0.75))
 
 
+def prepare_lunar_limb_image(image: np.ndarray) -> np.ndarray:
+    """Normalize and lightly denoise one frame once for all limb fits."""
+    return cv2.GaussianBlur(_normalized_gray(image), (0, 0), 1.2)
+
+
 def refine_lunar_limb(
     image: np.ndarray,
     initial_circle: tuple[float, float, float] | np.ndarray,
@@ -194,6 +199,7 @@ def refine_lunar_limb(
     fixed_radius: float | None = None,
     samples: int = 720,
     search_px: int = 24,
+    prepared_gray: np.ndarray | None = None,
 ) -> tuple[tuple[float, float, float], float, float, int] | None:
     """Fit the outer lunar limb and return ``(circle, rms, coverage, count)``.
 
@@ -208,9 +214,9 @@ def refine_lunar_limb(
     if radius <= 8:
         return None
 
-    gray = _normalized_gray(image)
-    # Blur only enough to suppress sensor noise; do not blur the physical limb.
-    gray = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    # Reuse the same normalized analysis image when the caller tries multiple
+    # models. This avoids repeated full-frame percentile scans and blurs.
+    gray = prepared_gray if prepared_gray is not None else prepare_lunar_limb_image(image)
     height, width = gray.shape
     offsets = np.arange(-search_px, search_px + 1, dtype=np.float32)
     angles = np.linspace(0.0, 2.0 * np.pi, samples, endpoint=False, dtype=np.float32)
@@ -283,6 +289,7 @@ def refine_lunar_limb_elliptical(
     *,
     samples: int = 720,
     search_px: int = 24,
+    prepared_gray: np.ndarray | None = None,
 ) -> tuple[
     tuple[float, float, float], float, float, int,
     tuple[float, float, float] | None, bool,
@@ -294,14 +301,21 @@ def refine_lunar_limb_elliptical(
     frames fall back to their own robust circle result. No state from another
     frame is accepted or returned as a prior.
     """
+    analysis_gray = (
+        prepared_gray if prepared_gray is not None else prepare_lunar_limb_image(image)
+    )
     circle_result = refine_lunar_limb(
         image, initial_circle, samples=samples, search_px=search_px,
+        prepared_gray=analysis_gray,
     )
     if circle_result is None:
         return None
     circle, circle_rms, _, _ = circle_result
 
-    sampled = _sample_limb_points(image, circle, samples=samples, search_px=search_px)
+    sampled = _sample_limb_points(
+        image, circle, samples=samples, search_px=search_px,
+        prepared_gray=analysis_gray,
+    )
     if sampled is None:
         return (*circle_result, None, False)
     points, strengths, coverage, quadrants = sampled
@@ -357,10 +371,11 @@ def _sample_limb_points(
     *,
     samples: int,
     search_px: int,
+    prepared_gray: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, int] | None:
     """Return signed outer-limb samples near ``circle``."""
     cx, cy, radius = map(float, circle[:3])
-    gray = cv2.GaussianBlur(_normalized_gray(image), (0, 0), 1.2)
+    gray = prepared_gray if prepared_gray is not None else prepare_lunar_limb_image(image)
     height, width = gray.shape
     offsets = np.arange(-search_px, search_px + 1, dtype=np.float32)
     angles = np.linspace(0.0, 2.0 * np.pi, samples, endpoint=False, dtype=np.float32)

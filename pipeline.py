@@ -1,4 +1,6 @@
 import os, math, time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import cv2, numpy as np
 
 from utils_common import (
@@ -10,6 +12,7 @@ from utils_common import (
 from algorithms_circle import detect_circle_phd2_enhanced, masked_phase_corr
 from algorithms_limb import (
     detect_faint_lunar_disk,
+    prepare_lunar_limb_image,
     refine_lunar_limb,
     refine_lunar_limb_elliptical,
 )
@@ -148,6 +151,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                                  reference_image_path=None, use_advanced_alignment=False,
                                  alignment_method='auto', strong_denoise=False):
     memory_manager = MemoryManager()
+    write_executor = None
     try:
         input_folder = normalize_path(input_folder)
         output_folder = normalize_path(output_folder)
@@ -256,9 +260,11 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         # constraint when one target contains only a short illuminated arc.
         # Every target center is still solved independently and output is never
         # scaled or linked to another target frame.
+        ref_limb_gray = prepare_lunar_limb_image(reference_image)
         ref_limb = refine_lunar_limb_elliptical(
             reference_image,
             (float(reference_center[0]), float(reference_center[1]), float(reference_radius)),
+            prepared_gray=ref_limb_gray,
         )
         if ref_limb is not None:
             ref_circle, ref_rms, ref_coverage, ref_points, ref_shape, ref_shape_updated = ref_limb
@@ -272,6 +278,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
             )
         else:
             log("⚠ 参考图外缘精定位失败，保留霍夫圆结果。", log_box)
+        del ref_limb_gray
 
         log(f"🎯 最终参考图像: {reference_filename}, 质量评分={best_quality:.1f}", log_box)
 
@@ -280,6 +287,27 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         success_count = 0; failed_files = []
         brightness_stats = {"bright": 0, "normal": 0, "dark": 0}
         method_stats = {}
+        # One background writer overlaps TIFF/JPEG encoding with the next
+        # frame's OpenCV analysis. A queue depth of two bounds extra memory to
+        # roughly two output frames and is safe with Tkinter on Windows/macOS.
+        write_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lunar-writer")
+        pending_writes = deque()
+
+        def finish_oldest_write():
+            nonlocal success_count
+            filename_done, future, success_message = pending_writes.popleft()
+            try:
+                saved = bool(future.result())
+            except Exception as write_error:
+                saved = False
+                log(f"  ✗ {filename_done}: 后台保存异常 - {write_error}", log_box)
+            if saved:
+                success_count += 1
+                log(success_message, log_box)
+            else:
+                if filename_done not in failed_files:
+                    log(f"  ✗ {filename_done}: 变换成功但保存失败", log_box)
+                    failed_files.append(filename_done)
 
         # 为速度统计
         t_all0 = time.time()
@@ -292,6 +320,8 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
 
                 # 参考图：直接另存
                 if filename == reference_filename:
+                    while pending_writes:
+                        finish_oldest_write()
                     output_path = safe_join(output_folder, f"aligned_{filename}")
                     if imwrite_with_exif(input_path, output_path, reference_image):
                         success_count += 1
@@ -329,7 +359,10 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 ellipse_cross_checked = False
                 # Every target is solved independently. No previous-frame
                 # center, radius, or ellipse shape is allowed into this fit.
-                limb = refine_lunar_limb_elliptical(target_image, circle)
+                limb_analysis_gray = prepare_lunar_limb_image(target_image)
+                limb = refine_lunar_limb_elliptical(
+                    target_image, circle, prepared_gray=limb_analysis_gray,
+                )
                 # A fitted ellipse can have a deceptively small residual while
                 # selecting an illumination boundary instead of the physical
                 # limb.  This is most visible when its equivalent radius differs
@@ -378,6 +411,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                             limb_circle,
                             fixed_radius=float(reference_radius),
                             search_px=32,
+                            prepared_gray=limb_analysis_gray,
                         )
                         if fixed_limb is not None:
                             fixed_circle, fixed_rms, fixed_coverage, fixed_points = fixed_limb
@@ -507,31 +541,52 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 except Exception as e:
                     log(f"    [Refine异常] {filename}: {e}", log_box)
 
-                # 保存
+                # 保存。调试样张保持同步，以便立即生成对应诊断图；其余
+                # 图片由单后台线程编码，与下一帧检测重叠。
                 out_path = safe_join(output_folder, f"aligned_{filename}")
-                if imwrite_with_exif(input_path, out_path, aligned):
-                    success_count += 1
-                    log(f"  ✓ {filename}: 偏移=({shift_x:.1f},{shift_y:.1f}), "
-                        f"质量={quality:.1f}, 置信度={confidence:.3f}, 圆检耗时={dt_det:.2f}s, 读取={dt_read:.2f}s | {align_method}", log_box)
-
-                    if debug_mode and filename == debug_image_basename and processed is not None:
+                success_message = (
+                    f"  ✓ {filename}: 偏移=({shift_x:.1f},{shift_y:.1f}), "
+                    f"质量={quality:.1f}, 置信度={confidence:.3f}, "
+                    f"圆检耗时={dt_det:.2f}s, 读取={dt_read:.2f}s | {align_method}"
+                )
+                is_debug_target = debug_mode and filename == debug_image_basename
+                if is_debug_target:
+                    while pending_writes:
+                        finish_oldest_write()
+                    if imwrite_with_exif(input_path, out_path, aligned):
+                        success_count += 1
+                        log(success_message, log_box)
+                    else:
+                        log(f"  ✗ {filename}: 变换成功但保存失败", log_box)
+                        failed_files.append(filename)
+                    if processed is not None:
                         save_debug_image(processed, target_center, reference_center,
                                          shift_x, shift_y, confidence, align_method,
                                          debug_output_folder, filename, reference_filename)
                 else:
-                    log(f"  ✗ {filename}: 变换成功但保存失败", log_box)
-                    failed_files.append(filename)
+                    future = write_executor.submit(
+                        imwrite_with_exif, input_path, out_path, aligned,
+                    )
+                    pending_writes.append((filename, future, success_message))
+                    if len(pending_writes) >= 2:
+                        finish_oldest_write()
 
-                del target_image, aligned
+                del target_image, aligned, limb_analysis_gray
                 if 'processed' in locals(): del processed
-                force_garbage_collection()
+                if (i + 1) % 16 == 0 and memory_manager.should_clear_memory():
+                    force_garbage_collection()
 
             except Exception as e:
                 log(f"  ✗ {filename}: 处理异常 - {e}", log_box)
                 failed_files.append(filename)
-                for v in ['target_image','aligned','processed']:
+                for v in ['target_image','aligned','processed','limb_analysis_gray']:
                     if v in locals(): del locals()[v]
                 force_garbage_collection()
+
+        while pending_writes:
+            finish_oldest_write()
+        write_executor.shutdown(wait=True)
+        write_executor = None
 
         if progress_callback: progress_callback(100, "处理完成")
         del reference_image; force_garbage_collection()
@@ -556,4 +611,6 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         if completion_callback:
             completion_callback(False, err)
     finally:
+        if write_executor is not None:
+            write_executor.shutdown(wait=True)
         force_garbage_collection()

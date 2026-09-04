@@ -2,9 +2,16 @@
 
 月食照片批量平移对齐工具。它以月球外缘的几何中心为基准，适用于从偏食、全食到复圆阶段亮度跨度很大的序列。
 
-当前版本：**V1.4.0-beta**
+当前版本：**V1.5.0-beta**
 
-构建文件名：`Lunar_Eclipse_Align_Tool_V140b`
+构建文件名：`Lunar_Eclipse_Align_Tool_V150b`
+
+## V1.5.0-beta 更新
+
+- TIFF/JPEG 编码移至单后台写入线程，与下一帧的 OpenCV 检测并行；队列最多保留两张输出图，兼顾速度和内存占用。
+- 同一帧的圆、椭圆和参考半径拟合复用一次归一化灰度图，减少重复的全图百分位统计与高斯降噪。
+- 不再每帧强制执行 Python 全量垃圾回收；改为定期检查内存，超过阈值时才回收。
+- 这些优化使用线程而非多进程，兼容 Windows/macOS 的 Tkinter GUI 和 PyInstaller 单文件构建。
 
 ## V1.4.0-beta 更新
 
@@ -66,7 +73,7 @@ python main.py
 
 ## 使用方法
 
-1. 选择包含待对齐照片的输入文件夹。程序会自动建议名为 `_aligned_V140b` 的输出文件夹。
+1. 选择包含待对齐照片的输入文件夹。程序会自动建议名为 `_aligned_V150b` 的输出文件夹。
 2. 打开“预览 & 半径估计”，选择一张月缘清晰、信噪比较高的照片。
 3. 自动检测或框选月面，并将检测半径和当前照片应用为参考。
 4. 检查最小/最大半径范围。范围应覆盖真实月面半径，但不宜过宽。
@@ -97,7 +104,7 @@ python main.py
 python build.py
 ```
 
-PyInstaller 输出文件名为 `Lunar_Eclipse_Align_Tool_V140b`，生成在 `dist` 目录中。
+PyInstaller 输出文件名为 `Lunar_Eclipse_Align_Tool_V150b`，生成在 `dist` 目录中。
 
 ## 许可证
 
