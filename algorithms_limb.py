@@ -13,6 +13,180 @@ import cv2
 import numpy as np
 
 
+def detect_faint_lunar_disk(
+    image: np.ndarray,
+    fixed_radius: float,
+    *,
+    max_side: int = 640,
+) -> tuple[tuple[float, float, float], float, str] | None:
+    """Locate an extremely faint disk with a fixed-radius annular matched filter.
+
+    This is a low-contrast fallback, not a display operation.  It works on a
+    temporary analysis image: remove a smooth sky background, denoise before
+    contrast amplification, then integrate the signed inner-to-outer contrast
+    around the whole expected limb.  The original image is never modified.
+
+    Colour input is checked independently in luminance and red-minus-blue.  A
+    candidate is accepted only when both channels agree, which rejects most
+    noise peaks and sky gradients.  Monochrome input uses a stricter peak gate.
+    """
+    if image is None or image.size == 0 or not np.isfinite(fixed_radius):
+        return None
+    height, width = image.shape[:2]
+    radius = float(fixed_radius)
+    if radius <= 8 or 2.0 * radius >= min(height, width):
+        return None
+
+    scale = min(1.0, float(max_side) / max(height, width))
+    if scale < 1.0:
+        small = cv2.resize(
+            image, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        small = image.copy()
+    small = small.astype(np.float32)
+
+    if small.ndim == 3:
+        blue, green, red = cv2.split(small[:, :, :3])
+        channels = [
+            ("亮度", 0.114 * blue + 0.587 * green + 0.299 * red),
+            ("红蓝色差", red - blue),
+        ]
+    else:
+        channels = [("灰度", small)]
+
+    scaled_radius = radius * scale
+    band = max(1.4, scaled_radius * 0.012)
+    kernel = _annular_edge_kernel(scaled_radius, band)
+    candidates = []
+    for channel_name, channel in channels:
+        residual = _remove_smooth_background(channel)
+        # Denoise before clipping/stretching.  Keeping the data in float avoids
+        # an extra 8-bit quantisation step on already faint edges.
+        residual = cv2.GaussianBlur(residual, (0, 0), max(0.8, band * 0.45))
+        low, high = np.percentile(residual, (1.0, 99.0))
+        if not np.isfinite(low + high) or high - low < 1e-4:
+            continue
+        residual = np.clip(residual, low, high)
+
+        response = cv2.filter2D(
+            residual, cv2.CV_32F, kernel, borderType=cv2.BORDER_CONSTANT,
+        )
+        margin = int(math.ceil(scaled_radius + 4.0 * band)) + 1
+        if response.shape[0] <= 2 * margin or response.shape[1] <= 2 * margin:
+            continue
+        valid = response[margin:-margin, margin:-margin]
+        _, peak, _, location = cv2.minMaxLoc(valid)
+        px = int(location[0] + margin)
+        py = int(location[1] + margin)
+        sub_x = _quadratic_peak_offset(response[py, px - 1:px + 2])
+        sub_y = _quadratic_peak_offset(response[py - 1:py + 2, px])
+
+        median = float(np.median(valid))
+        mad = 1.4826 * float(np.median(np.abs(valid - median)))
+        peak_z = (float(peak) - median) / max(mad, 1e-6)
+        candidates.append((channel_name, px + sub_x, py + sub_y, peak_z))
+
+    if not candidates:
+        return None
+    if len(channels) > 1:
+        if len(candidates) < 2:
+            return None
+        first, second = candidates[:2]
+        disagreement = math.hypot(first[1] - second[1], first[2] - second[2])
+        if disagreement > max(3.0, 0.035 * scaled_radius):
+            return None
+        confidence = min(first[3], second[3])
+        if confidence < 7.0:
+            return None
+        weights = np.maximum([first[3], second[3]], 1.0)
+        fit_cx = float(np.average([first[1], second[1]], weights=weights))
+        fit_cy = float(np.average([first[2], second[2]], weights=weights))
+        detail = f"双通道一致, peakZ={confidence:.1f}"
+    else:
+        only = candidates[0]
+        confidence = only[3]
+        if confidence < 10.0:
+            return None
+        fit_cx, fit_cy = float(only[1]), float(only[2])
+        detail = f"单通道, peakZ={confidence:.1f}"
+
+    return (
+        (fit_cx / scale, fit_cy / scale, radius),
+        float(confidence),
+        detail,
+    )
+
+
+def _remove_smooth_background(channel: np.ndarray) -> np.ndarray:
+    """Robustly subtract a quadratic sky/background surface."""
+    height, width = channel.shape
+    fit_scale = min(1.0, 240.0 / max(height, width))
+    if fit_scale < 1.0:
+        fit_image = cv2.resize(
+            channel, None, fx=fit_scale, fy=fit_scale, interpolation=cv2.INTER_AREA,
+        )
+    else:
+        fit_image = channel
+    fit_h, fit_w = fit_image.shape
+    yy, xx = np.mgrid[0:fit_h, 0:fit_w]
+    x = (xx.ravel() - 0.5 * (fit_w - 1)) / max(fit_w, 1)
+    y = (yy.ravel() - 0.5 * (fit_h - 1)) / max(fit_h, 1)
+    design = np.column_stack((np.ones(x.size), x, y, x * x, x * y, y * y))
+    values = fit_image.reshape(-1).astype(np.float64)
+    keep = np.ones(values.size, dtype=bool)
+    coefficients = None
+    for _ in range(5):
+        if int(np.count_nonzero(keep)) < 32:
+            return channel.astype(np.float32) - float(np.median(channel))
+        coefficients, *_ = np.linalg.lstsq(design[keep], values[keep], rcond=None)
+        error = values - design @ coefficients
+        center = float(np.median(error[keep]))
+        scale = 1.4826 * float(np.median(np.abs(error[keep] - center)))
+        if scale < 1e-6:
+            break
+        new_keep = np.abs(error - center) <= 2.5 * scale
+        if np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+
+    full_y, full_x = np.mgrid[0:height, 0:width]
+    full_x = (full_x - 0.5 * (width - 1)) / max(width, 1)
+    full_y = (full_y - 0.5 * (height - 1)) / max(height, 1)
+    background = (
+        coefficients[0] + coefficients[1] * full_x + coefficients[2] * full_y
+        + coefficients[3] * full_x * full_x
+        + coefficients[4] * full_x * full_y
+        + coefficients[5] * full_y * full_y
+    )
+    return channel.astype(np.float32) - background.astype(np.float32)
+
+
+def _annular_edge_kernel(radius: float, band: float) -> np.ndarray:
+    margin = int(math.ceil(4.0 * band))
+    size = int(2 * math.ceil(radius + margin) + 1)
+    yy, xx = np.mgrid[0:size, 0:size]
+    distance = np.hypot(xx - size // 2, yy - size // 2)
+    inner = np.exp(-0.5 * ((distance - (radius - band)) / band) ** 2)
+    outer = np.exp(-0.5 * ((distance - (radius + band)) / band) ** 2)
+    kernel = inner - outer
+    kernel[np.abs(distance - radius) > 4.0 * band] = 0.0
+    kernel -= float(np.mean(kernel))
+    kernel /= max(float(np.linalg.norm(kernel)), 1e-6)
+    return kernel.astype(np.float32)
+
+
+def _quadratic_peak_offset(values: np.ndarray) -> float:
+    if values.size != 3 or not np.all(np.isfinite(values)):
+        return 0.0
+    left, center, right = map(float, values)
+    denominator = left - 2.0 * center + right
+    if abs(denominator) < 1e-9:
+        return 0.0
+    return float(np.clip(0.5 * (left - right) / denominator, -0.75, 0.75))
+
+
 def refine_lunar_limb(
     image: np.ndarray,
     initial_circle: tuple[float, float, float] | np.ndarray,

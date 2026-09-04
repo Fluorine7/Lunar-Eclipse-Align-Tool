@@ -8,7 +8,11 @@ from utils_common import (
 )
 
 from algorithms_circle import detect_circle_phd2_enhanced, masked_phase_corr
-from algorithms_limb import refine_lunar_limb, refine_lunar_limb_elliptical
+from algorithms_limb import (
+    detect_faint_lunar_disk,
+    refine_lunar_limb,
+    refine_lunar_limb_elliptical,
+)
 
 # refine 返回可能是 (M, score, nin) 也可能是 (M, theta_deg, score, nin)
 from algorithms_refine import refine_alignment_multi_roi  # 兼容旧/新签名
@@ -320,6 +324,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     failed_files.append(filename); del target_image; continue
 
                 limb_used = False
+                faint_limb_used = False
                 # Every target is solved independently. No previous-frame
                 # center, radius, or ellipse shape is allowed into this fit.
                 limb = refine_lunar_limb_elliptical(target_image, circle)
@@ -367,6 +372,28 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                         f"shape={'independent' if shape_updated else 'circle-fallback'}",
                         log_box,
                     )
+                elif reference_radius is not None:
+                    # If normal edge sampling cannot obtain a trustworthy limb,
+                    # try a fixed-radius annular matched filter on a temporary
+                    # enhanced analysis copy.  It never modifies the output and
+                    # uses no previous target frame.
+                    faint_limb = detect_faint_lunar_disk(
+                        target_image, float(reference_radius),
+                    )
+                    if faint_limb is not None:
+                        faint_circle, faint_confidence, faint_detail = faint_limb
+                        circle = np.asarray(faint_circle, dtype=np.float32)
+                        quality = max(float(quality), min(95.0, 35.0 + 3.0 * faint_confidence))
+                        method = f"{method} + 低信噪比环积分(参考半径)"
+                        limb_used = True
+                        faint_limb_used = True
+                        log(
+                            f"    [FaintLimb:参考半径环积分] center=({circle[0]:.2f}, {circle[1]:.2f}), "
+                            f"r={circle[2]:.2f}px, {faint_detail}",
+                            log_box,
+                        )
+                    else:
+                        log("    [Limb] 外缘精定位及低信噪比回退均不可靠，保留霍夫圆结果。", log_box)
                 else:
                     log("    [Limb] 外缘精定位不可靠，保留霍夫圆结果。", log_box)
 
@@ -379,7 +406,10 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 shift_x = reference_center[0] - target_center[0]
                 shift_y = reference_center[1] - target_center[1]
                 confidence = max(0.30, min(0.98, quality / 100.0))
-                align_method = "外缘圆心对齐" if limb_used else "霍夫圆心对齐"
+                if faint_limb_used:
+                    align_method = "低信噪比参考半径环积分对齐"
+                else:
+                    align_method = "外缘圆心对齐" if limb_used else "霍夫圆心对齐"
                 theta_deg = 0.0
 
                 rows, cols = target_image.shape[:2]
@@ -472,7 +502,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         log("=" * 60, log_box)
         log(f"增量对齐完成! 成功对齐 {success_count}/{total_files} 张图像", log_box)
         log(f"使用参考图像: {reference_filename}", log_box)
-        log(f"对齐流程: {'受约束椭圆/稳健圆外缘 + 实验性纹理微调（仅平移）' if use_advanced_alignment else '霍夫初定位 + 受约束椭圆/稳健圆外缘对齐（仅平移）'}", log_box)
+        log(f"对齐流程: {'受约束椭圆/稳健圆外缘 + 低信噪比环积分回退 + 实验性纹理微调（仅平移）' if use_advanced_alignment else '霍夫初定位 + 受约束椭圆/稳健圆外缘 + 低信噪比环积分回退（仅平移）'}", log_box)
         if failed_files:
             head = ', '.join(failed_files[:5]) + ("..." if len(failed_files)>5 else "")
             log(f"失败文件({len(failed_files)}): {head}", log_box)
