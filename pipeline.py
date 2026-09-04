@@ -325,9 +325,42 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
 
                 limb_used = False
                 faint_limb_used = False
+                faint_limb_precomputed = None
+                ellipse_cross_checked = False
                 # Every target is solved independently. No previous-frame
                 # center, radius, or ellipse shape is allowed into this fit.
                 limb = refine_lunar_limb_elliptical(target_image, circle)
+                # A fitted ellipse can have a deceptively small residual while
+                # selecting an illumination boundary instead of the physical
+                # limb.  This is most visible when its equivalent radius differs
+                # materially from the reference. Cross-check its center against
+                # an independent fixed-radius annular integral on the same frame.
+                if (
+                    limb is not None
+                    and limb[4] is not None
+                    and limb[5]
+                    and reference_radius is not None
+                    and abs(float(limb[0][2]) - float(reference_radius))
+                        > 0.01 * float(reference_radius)
+                ):
+                    ellipse_check = detect_faint_lunar_disk(
+                        target_image, float(reference_radius),
+                    )
+                    if ellipse_check is not None:
+                        check_circle = ellipse_check[0]
+                        center_disagreement = math.hypot(
+                            float(limb[0][0]) - float(check_circle[0]),
+                            float(limb[0][1]) - float(check_circle[1]),
+                        )
+                        if center_disagreement > 3.0:
+                            log(
+                                f"    [Limb:椭圆交叉校验] 圆心分歧={center_disagreement:.2f}px，"
+                                "拒绝椭圆并采用当前帧参考半径解。",
+                                log_box,
+                            )
+                            faint_limb_precomputed = ellipse_check
+                            ellipse_cross_checked = True
+                            limb = None
                 if limb is not None:
                     limb_circle, limb_rms, limb_coverage, limb_points, limb_shape, shape_updated = limb
                     radius_constrained = False
@@ -377,18 +410,22 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     # try a fixed-radius annular matched filter on a temporary
                     # enhanced analysis copy.  It never modifies the output and
                     # uses no previous target frame.
-                    faint_limb = detect_faint_lunar_disk(
+                    faint_limb = faint_limb_precomputed or detect_faint_lunar_disk(
                         target_image, float(reference_radius),
                     )
                     if faint_limb is not None:
                         faint_circle, faint_confidence, faint_detail = faint_limb
                         circle = np.asarray(faint_circle, dtype=np.float32)
                         quality = max(float(quality), min(95.0, 35.0 + 3.0 * faint_confidence))
-                        method = f"{method} + 低信噪比环积分(参考半径)"
+                        fallback_name = (
+                            "椭圆交叉校验环积分" if ellipse_cross_checked
+                            else "低信噪比环积分"
+                        )
+                        method = f"{method} + {fallback_name}(参考半径)"
                         limb_used = True
                         faint_limb_used = True
                         log(
-                            f"    [FaintLimb:参考半径环积分] center=({circle[0]:.2f}, {circle[1]:.2f}), "
+                            f"    [FaintLimb:{fallback_name}] center=({circle[0]:.2f}, {circle[1]:.2f}), "
                             f"r={circle[2]:.2f}px, {faint_detail}",
                             log_box,
                         )
