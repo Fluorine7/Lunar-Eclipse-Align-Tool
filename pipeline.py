@@ -184,6 +184,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
         reference_image = None; reference_center = None
         reference_filename = None; best_quality = 0.0
         reference_radius = None
+        reference_source_path = None
 
         # ---------- 用户指定参考图 ----------
         if reference_image_path and os.path.exists(reference_image_path):
@@ -204,6 +205,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     reference_image = ref_img.copy()
                     reference_center = (circle[0], circle[1])
                     reference_filename = ref_filename
+                    reference_source_path = reference_image_path
                     best_quality = q
                     reference_radius = circle[2]
                     log(f"✓ 参考图像检测成功: 质量={q:.1f}, 方法={meth}, 半径≈{reference_radius:.1f}px", log_box)
@@ -218,6 +220,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                         reference_image = ref_img.copy()
                         reference_center = (circle_full[0], circle_full[1])
                         reference_filename = ref_filename
+                        reference_source_path = reference_image_path
                         best_quality = float(qf)
                         reference_radius = float(circle_full[2])
                         log(f"✓ 参考图像检测成功: 质量={best_quality:.1f}, 方法={mf}, 半径≈{reference_radius:.1f}px, 用时 {dt1:.2f}s", log_box)
@@ -246,6 +249,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                     reference_image = img0.copy()
                     reference_center = (circle[0], circle[1])
                     reference_filename = filename
+                    reference_source_path = input_path
                     best_quality = q
                     reference_radius = circle[2]
                     log(f"  候选参考图像: {filename}, 质量={q:.1f}, 方法={meth}", log_box)
@@ -319,7 +323,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 input_path = safe_join(input_folder, filename)
 
                 # 参考图：直接另存
-                if filename == reference_filename:
+                if os.path.normcase(os.path.realpath(input_path)) == os.path.normcase(os.path.realpath(reference_source_path)):
                     while pending_writes:
                         finish_oldest_write()
                     output_path = safe_join(output_folder, f"aligned_{filename}")
@@ -349,32 +353,38 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                 )
                 dt_det = time.time() - t_det
 
-                if circle is None:
-                    log(f"  ✗ {filename}: 圆检测失败(耗时 {dt_det:.2f}s)", log_box)
-                    failed_files.append(filename); del target_image; continue
-
                 limb_used = False
                 faint_limb_used = False
                 faint_limb_precomputed = None
+                if circle is None:
+                    faint_limb_precomputed = detect_faint_lunar_disk(
+                        target_image, float(reference_radius),
+                    ) if reference_radius is not None else None
+                    if faint_limb_precomputed is None:
+                        log(f"  ✗ {filename}: 初定位及低信噪比回退均失败", log_box)
+                        failed_files.append(filename)
+                        del target_image, processed
+                        continue
+                    # Preserve the independently validated annular solution.
+                    brightness = "dark"
+                    method = "环积分初定位"
                 ellipse_cross_checked = False
                 # Every target is solved independently. No previous-frame
                 # center, radius, or ellipse shape is allowed into this fit.
                 limb_analysis_gray = prepare_lunar_limb_image(target_image)
-                limb = refine_lunar_limb_elliptical(
+                limb = None if faint_limb_precomputed is not None else refine_lunar_limb_elliptical(
                     target_image, circle, prepared_gray=limb_analysis_gray,
                 )
                 # A fitted ellipse can have a deceptively small residual while
                 # selecting an illumination boundary instead of the physical
-                # limb.  This is most visible when its equivalent radius differs
-                # materially from the reference. Cross-check its center against
+                # limb. A plausible radius does not guarantee a correct center.
+                # Cross-check every ellipse center against
                 # an independent fixed-radius annular integral on the same frame.
                 if (
                     limb is not None
                     and limb[4] is not None
                     and limb[5]
                     and reference_radius is not None
-                    and abs(float(limb[0][2]) - float(reference_radius))
-                        > 0.01 * float(reference_radius)
                 ):
                     ellipse_check = detect_faint_lunar_disk(
                         target_image, float(reference_radius),
@@ -387,7 +397,7 @@ def align_moon_images_incremental(input_folder, output_folder, hough_params,
                         )
                         if center_disagreement > 3.0:
                             log(
-                                f"    [Limb:椭圆交叉校验] 圆心分歧={center_disagreement:.2f}px，"
+                                f"    [Limb:椭圆交叉校验:{filename}] 圆心分歧={center_disagreement:.2f}px，"
                                 "拒绝椭圆并采用当前帧参考半径解。",
                                 log_box,
                             )

@@ -90,6 +90,17 @@ def detect_faint_lunar_disk(
 
     if not candidates:
         return None
+    # Colour is supporting evidence only when it contains a significant disk.
+    # For neutral RGB data, require the stricter luminance-only gate below.
+    # Never substitute a colour-only peak when luminance has failed.
+    if len(channels) > 1:
+        luminance = next((c for c in candidates if c[0] == "亮度"), None)
+        colour = next((c for c in candidates if c[0] == "红蓝色差"), None)
+        if luminance is None:
+            return None
+        if colour is None or colour[3] < 7.0:
+            channels = channels[:1]
+            candidates = [luminance]
     if len(channels) > 1:
         if len(candidates) < 2:
             return None

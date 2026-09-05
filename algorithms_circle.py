@@ -1,4 +1,4 @@
-import math, time
+import math
 import numpy as np
 import cv2
 
@@ -321,8 +321,6 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
     失败: (None, processed_or_input_gray, 0, 'error', 'unknown')
     """
     try:
-        t0 = time.time()
-        TIME_BUDGET = 6.0  # seconds per frame guard for extreme cases
         processed, brightness_mode = adaptive_preprocessing(image, "auto")
         # 可选：强力降噪（仅影响检测，不影响最终成片）
         if strong_denoise:
@@ -381,19 +379,6 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
                     pass
 
         # —— 稳健外缘 RANSAC —— #
-        if time.time() - t0 > TIME_BUDGET:
-            # Fall back to quick thumbnail Hough on the detection image
-            scale = min(1.0, 1600.0 / max(H, W))
-            small = cv2.resize(processed_det, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-            sc = cv2.HoughCircles(small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[0]//2,
-                                  param1=max(param1, 20), param2=max(param2-5, 8),
-                                  minRadius=max(1, int(min_radius*scale)), maxRadius=max(2, int(max_radius*scale)))
-            if sc is not None:
-                c = sc[0][0]
-                best_circle = np.array([c[0]/scale, c[1]/scale, c[2]/scale], dtype=np.float32)
-                best_score = evaluate_circle_quality(processed, best_circle) * 0.9
-                detection_method = "超时降级(thumb)"
-                return best_circle, processed, best_score, detection_method, brightness_mode
         try:
             robust = detect_circle_robust(processed_det, None)
             if robust is not None:
@@ -406,18 +391,6 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
             pass
 
         # —— 标准霍夫（在 ROI 上） —— #
-        if time.time() - t0 > TIME_BUDGET:
-            scale = min(1.0, 1600.0 / max(H, W))
-            small = cv2.resize(processed_det, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-            sc = cv2.HoughCircles(small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[0]//2,
-                                  param1=max(param1, 20), param2=max(param2-5, 8),
-                                  minRadius=max(1, int(min_radius*scale)), maxRadius=max(2, int(max_radius*scale)))
-            if sc is not None:
-                c = sc[0][0]
-                best_circle = np.array([c[0]/scale, c[1]/scale, c[2]/scale], dtype=np.float32)
-                best_score = evaluate_circle_quality(processed, best_circle) * 0.9
-                detection_method = "超时降级(thumb)"
-                return best_circle, processed, best_score, detection_method, brightness_mode
         try:
             height, _ = processed_det.shape
             circles = cv2.HoughCircles(
@@ -483,18 +456,6 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
                 pass
 
         # —— padding-based fallback —— #
-        if time.time() - t0 > TIME_BUDGET:
-            scale = min(1.0, 1600.0 / max(H, W))
-            small = cv2.resize(processed_det, (int(W*scale), int(H*scale)), interpolation=cv2.INTER_AREA)
-            sc = cv2.HoughCircles(small, cv2.HOUGH_GRADIENT, dp=1.2, minDist=small.shape[0]//2,
-                                  param1=max(param1, 20), param2=max(param2-5, 8),
-                                  minRadius=max(1, int(min_radius*scale)), maxRadius=max(2, int(max_radius*scale)))
-            if sc is not None:
-                c = sc[0][0]
-                best_circle = np.array([c[0]/scale, c[1]/scale, c[2]/scale], dtype=np.float32)
-                best_score = evaluate_circle_quality(processed, best_circle) * 0.9
-                detection_method = "超时降级(thumb)"
-                return best_circle, processed, best_score, detection_method, brightness_mode
         def _touches_border(circle, w, h, margin=5):
             if circle is None:
                 return True
