@@ -3,8 +3,8 @@ import os, sys, platform, shutil, plistlib, subprocess
 from PyInstaller.__main__ import run
 from PyInstaller.utils.hooks import collect_data_files
 
-APP_NAME = "Lunar_Eclipse_Align_Tool_V150b"
-APP_VERSION = "1.5.0"
+APP_NAME = "Lunar_Eclipse_Align_Tool_V151b"
+APP_VERSION = "1.5.1"
 ENTRY = "main.py"
 MACOS_MIN_VERSION = "14.0"
 BUNDLE_IDENTIFIER = "com.fluorine.lunar-eclipse-align-tool"

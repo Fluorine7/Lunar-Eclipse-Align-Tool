@@ -1114,7 +1114,7 @@ class UniversalLunarAlignApp:
         if path:
             path = normalize_path(path); self.input_var.set(path)
             parent = os.path.dirname(path); name = os.path.basename(path)
-            self.output_var.set(safe_join(parent, f"{name}_aligned_V150b"))
+            self.output_var.set(safe_join(parent, f"{name}_aligned_V151b"))
 
     def select_output_folder(self):
         path = filedialog.askdirectory(title="选择输出文件夹")
