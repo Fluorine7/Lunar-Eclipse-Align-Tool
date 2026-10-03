@@ -1,442 +1,235 @@
+"""Pair-local texture refinement AFTER independent limb alignment.
+
+Measured displacement is target relative to reference; the returned matrix is
+its INVERSE, applied to the target. No previous frame, clock deadline or mutable
+image cache participates. All filters operate on analysis copies only.
+"""
+import math
+
 import cv2
 import numpy as np
-import math
-import time
-
-# ---------------- 工具函数 ----------------
-
-def _soft_disk_mask(h, w, cx, cy, r, inner=0.0, outer=0.98):
-    Y, X = np.ogrid[:h, :w]
-    dist = np.sqrt((X - cx)**2 + (Y - cy)**2)
-    m = np.zeros((h, w), np.float32)
-    r_in = r * max(0.0, inner)
-    r_out = r * min(1.0, outer)
-    core = dist <= (r_out * 0.90)
-    m[core] = 1.0
-    band = (dist > (r_out * 0.90)) & (dist <= r_out)
-    if np.any(band):
-        t = (dist[band] - r_out * 0.90) / (r_out * 0.10 + 1e-6)
-        m[band] = 0.5 * (1 + np.cos(np.pi * t))
-    if r_in > 1:
-        m[dist < r_in] = 0
-    return m
 
 
-def _clahe_and_bandpass(gray):
-    g = gray
-    # Ensure 8-bit input
-    if g.dtype != np.uint8:
-        g = cv2.normalize(g.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+def _prepare(gray):
+    if gray.ndim != 2 or not np.isfinite(gray).all():
+        raise ValueError('纹理微调需要有限值的二维灰度图')
+    raw = gray.astype(np.float32)
+    low, high = np.percentile(raw, (1, 99.5))
+    if high <= low:
+        return None
+    valid = np.ones(gray.shape, bool)
+    if np.issubdtype(gray.dtype, np.integer):
+        valid &= (gray > 0) & (gray < np.iinfo(gray.dtype).max)
+    raw = (raw - float(low)) / float(high - low)  # No clipping or per-tile CLAHE.
+    fine = cv2.GaussianBlur(raw, (0, 0), 1.2) - cv2.GaussianBlur(raw, (0, 0), 6.)
+    coarse = cv2.GaussianBlur(raw, (0, 0), 2.4) - cv2.GaussianBlur(raw, (0, 0), 9.)
+    noise = raw - cv2.GaussianBlur(raw, (0, 0), .7)
+    return fine, coarse, noise, valid
 
-    # Local contrast to suppress global illumination, emphasize small-scale details
-    cla = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(g)
 
-    # High-pass only (remove mid/low frequencies): unsharp mask
-    hp = cv2.subtract(cla, cv2.GaussianBlur(cla, (0,0), 6.0))  # sigma ~6 -> keep only high freq
+def _zncc(a, b):
+    a = a.astype(np.float64) - float(np.mean(a))
+    b = b.astype(np.float64) - float(np.mean(b))
+    norm = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.sum(a * b) / norm) if norm > 1e-12 else -1.
 
-    # Edge emphasis via Laplacian (pure high-frequency operator)
-    lap = cv2.Laplacian(cla, cv2.CV_32F, ksize=3)
 
-    # Combine and normalize
-    combo = 0.5 * np.abs(hp.astype(np.float32)) + 0.5 * np.abs(lap)
-    combo = cv2.normalize(combo, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    return combo
+def _patch(image, x, y, width, height):
+    if x < 0 or y < 0 or x + width > image.shape[1] or y + height > image.shape[0]:
+        return None
+    return cv2.getRectSubPix(image, (width, height), (x + (width - 1) / 2, y + (height - 1) / 2))
 
 
 def _match_roi_zncc_local(ref_patch, tgt_img, x, y, search=12, mask_patch=None):
-    """Match ref_patch around (x,y) in tgt_img within +/-search window.
-    Uses TM_CCORR_NORMED with optional template mask (same size as ref_patch).
-    Returns (dx, dy, score).
+    """True zero-mean normalized correlation; return displacement, NOT warp.
+
+    Only complete interior patches are used. A nontrivial mask is refused so a
+    common artificial mask edge cannot become the matched feature.
     """
     h, w = ref_patch.shape
-    H, W = tgt_img.shape
-
-    # target search window centered at the ref patch center
-    cx = int(x + w/2)
-    cy = int(y + h/2)
-    x0 = max(0, cx - w//2 - search)
-    y0 = max(0, cy - h//2 - search)
-    x1 = min(W, x0 + w + 2*search)
-    y1 = min(H, y0 + h + 2*search)
+    if mask_patch is not None and not np.all(mask_patch):
+        return 0., 0., -1.
+    x0, y0 = max(0, int(x) - search), max(0, int(y) - search)
+    x1 = min(tgt_img.shape[1], int(x) + w + search)
+    y1 = min(tgt_img.shape[0], int(y) + h + search)
     crop = tgt_img[y0:y1, x0:x1]
-
-    if crop.shape[0] < h or crop.shape[1] < w:
-        return 0.0, 0.0, -1.0
-
-    tpl = ref_patch.astype(np.float32)
-    win = crop.astype(np.float32)
-
-    # Variance guard: if the (masked) template has almost no texture, skip
-    if mask_patch is not None and mask_patch.shape == ref_patch.shape:
-        m = (mask_patch.astype(np.float32) / 255.0)
-        area = m.sum()
-        if area < 16:  # too small effective area
-            return 0.0, 0.0, -1.0
-        tpl_eff = tpl[m > 0.5]
-        if tpl_eff.size == 0 or np.std(tpl_eff) < 1e-3:
-            return 0.0, 0.0, -1.0
-        method = cv2.TM_CCORR_NORMED
-        res = cv2.matchTemplate(win, tpl, method, mask=mask_patch.astype(np.uint8))
-    else:
-        if np.std(tpl) < 1e-3:
-            return 0.0, 0.0, -1.0
-        method = cv2.TM_CCORR_NORMED
-        res = cv2.matchTemplate(win, tpl, method)
-
-    # Handle NaN/Inf from OpenCV edge cases
-    if not np.isfinite(res).all():
-        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
-
-    minv, maxv, minloc, maxloc = cv2.minMaxLoc(res)
-    dx = (x0 + maxloc[0]) - (cx - w//2)
-    dy = (y0 + maxloc[1]) - (cy - h//2)
-    return float(dx), float(dy), float(maxv)
+    if crop.shape[0] < h or crop.shape[1] < w or ref_patch.std() < 1e-7:
+        return 0., 0., -1.
+    res = cv2.matchTemplate(crop, ref_patch, cv2.TM_CCOEFF_NORMED)
+    res = np.nan_to_num(res, nan=-1., posinf=-1., neginf=-1.)
+    _, peak, _, (px, py) = cv2.minMaxLoc(res)
+    if px == 0 or py == 0 or px == res.shape[1] - 1 or py == res.shape[0] - 1:
+        return 0., 0., -1.
+    other = res.copy()
+    other[max(0, py-2):py+3, max(0, px-2):px+3] = -1
+    if peak - float(other.max()) < .025:
+        return 0., 0., -1.
+    def quadratic(v0, v1, v2):
+        curvature = v0 - 2 * v1 + v2
+        return float(np.clip(.5 * (v0 - v2) / curvature, -.5, .5)) if curvature < -1e-7 else 0.
+    dx = x0 + px - x + quadratic(res[py, px-1], res[py, px], res[py, px+1])
+    dy = y0 + py - y + quadratic(res[py-1, px], res[py, px], res[py+1, px])
+    return float(dx), float(dy), float(peak)
 
 
-def _solve_abtx_ty(u, v, dx, dy, w=None):
-    """解线性最小二乘：
-    dpx = (cosθ-1)*u - sinθ*v + tx = a*u - b*v + tx
-    dpy = sinθ*u + (cosθ-1)*v + ty = b*u + a*v + ty
-    未强制单位圆约束，先解 a=cosθ-1, b=sinθ；随后归一化恢复 (cosθ, sinθ)。
-    支持权重 w。
-    返回：theta, tx, ty, cos_t, sin_t
-    """
-    u = np.asarray(u, dtype=np.float64).ravel()
-    v = np.asarray(v, dtype=np.float64).ravel()
-    dx = np.asarray(dx, dtype=np.float64).ravel()
-    dy = np.asarray(dy, dtype=np.float64).ravel()
-
-    n = u.size
-    A = np.zeros((2*n, 4), dtype=np.float64)
-    b = np.zeros((2*n,), dtype=np.float64)
-
-    # dpx 行
-    A[0::2, 0] = u       # a
-    A[0::2, 1] = -v      # b
-    A[0::2, 2] = 1.0     # tx
-    A[0::2, 3] = 0.0     # ty
-    b[0::2] = dx
-
-    # dpy 行
-    A[1::2, 0] = v       # a
-    A[1::2, 1] =  u      # b
-    A[1::2, 2] = 0.0     # tx
-    A[1::2, 3] = 1.0     # ty
-    b[1::2] = dy
-
-    if w is not None:
-        w = np.asarray(w, dtype=np.float64).ravel()
-        w = np.clip(w, 1e-6, None)
-        W = np.sqrt(np.repeat(w, 2))
-        A = A * W[:, None]
-        b = b * W
-
-    x, *_ = np.linalg.lstsq(A, b, rcond=None)
-    a, b_, tx, ty = x
-
-    cos_t = a + 1.0
-    sin_t = b_
-    # 归一化到单位圆，避免轻微缩放/剪切
-    s = math.hypot(cos_t, sin_t)
-    if s <= 1e-12:
-        cos_t, sin_t = 1.0, 0.0
-    else:
-        cos_t /= s
-        sin_t /= s
-
-    theta = math.atan2(sin_t, cos_t)
-    return float(theta), float(tx), float(ty), float(cos_t), float(sin_t)
-
-from utils_common import log as _uilog
-
-# simple debug bridge
-def _dbg(msg, debug_cb=None):
-    try:
-        if debug_cb is None:
-            print(msg)
-        else:
-            debug_cb(msg)
-    except Exception:
-        pass
+def _texture_ok(features, x, y, box):
+    fine, _, noise, valid = features
+    x, y = int(round(x)), int(round(y))
+    region = fine[y:y+box, x:x+box]
+    if region.shape != (box, box) or valid[y:y+box, x:x+box].mean() < .95:
+        return False
+    high = noise[y:y+box, x:x+box]
+    noise_sigma = 1.4826 * np.median(np.abs(high - np.median(high)))
+    return float(region.std()) > max(.002, .9 * float(noise_sigma))
 
 
-def _select_rois(energy_map, disk_mask, r, k=16, box=128, border=10, avoid_edge_ratio=0.06, ref_img=None, brightness_range=(30,220)):
-    """Pick top-k ROI boxes inside the lunar disk by local energy, spaced apart.
-    Supports adaptive ROI size based on local brightness if ref_img is provided.
-    """
-    h, w = energy_map.shape
-    rois = []
-    # keep away from limb/edge a little bit
-    margin = max(border, int(r * avoid_edge_ratio))
-    step = max(24, box // 2)  # stride to reduce overlap
-    integ = cv2.integral(energy_map.astype(np.float32))
-
-    def sum_rect(x0, y0, bw, bh):
-        # integral image sum over rectangle [x0,x0+bw) x [y0,y0+bh)
-        return float(integ[y0+bh, x0+bw] - integ[y0, x0+bw] - integ[y0+bh, x0] + integ[y0, x0])
-
-    for y in range(margin, h - margin - box, step):
-        for x in range(margin, w - margin - box, step):
-            submask = disk_mask[y:y+box, x:x+box]
-            if submask.mean() < 0.6:
+def _select_rois(features, cx, cy, radius, box, count, search):
+    fine = features[0]
+    h, w = fine.shape
+    buckets = [[] for _ in range(8)]
+    step = max(24, box * 3 // 4)
+    # Round-robin angular sectors: one illuminated side must not monopolize
+    # the evidence. No reference-centered mask is multiplied into the pixels.
+    for y in range(search + 2, h - box - search - 1, step):
+        for x in range(search + 2, w - box - search - 1, step):
+            corners = [(x-cx, y-cy), (x+box-cx, y-cy),
+                       (x-cx, y+box-cy), (x+box-cx, y+box-cy)]
+            if max(math.hypot(a, b) for a, b in corners) > .88 * radius:
                 continue
-            # Determine adaptive box size based on local brightness if ref_img provided
-            local_box = box
-            if ref_img is not None:
-                roi_block = ref_img[y:y+box, x:x+box]
-                bmin, bmax = brightness_range
-                frac_in = np.mean((roi_block >= bmin) & (roi_block <= bmax))
-                if frac_in < 0.4:
-                    continue
-                # Compute mean brightness in the ROI region
-                roi_brightness = np.mean(roi_block)
-                # Map brightness to ROI size: brighter -> larger ROI, darker -> smaller ROI
-                min_box = max(64, int(box * 0.5))
-                max_box = box
-                bmin, bmax = brightness_range
-                # Clamp brightness
-                b = np.clip(roi_brightness, bmin, bmax)
-                scale = (b - bmin) / (bmax - bmin)
-                local_box = int(min_box + scale * (max_box - min_box))
-                # Adjust local_box to be multiple of 8 for consistency
-                local_box = (local_box // 8) * 8
-                if local_box < 64:
-                    local_box = 64
-                if y + local_box > h - margin or x + local_box > w - margin:
-                    continue
-                submask = disk_mask[y:y+local_box, x:x+local_box]
-                if submask.mean() < 0.6:
-                    continue
-                score = sum_rect(x, y, local_box, local_box) / (local_box * local_box + 1e-6)
-                rois.append((score, x, y, local_box, local_box))
-            else:
-                score = sum_rect(x, y, box, box) / (box * box + 1e-6)
-                rois.append((score, x, y, box, box))
-
-    rois.sort(key=lambda t: t[0], reverse=True)
-
-    picked = []
-    for sc, x, y, bw, bh in rois:
-        too_close = False
-        for _sc2, x2, y2, bw2, bh2 in picked:
-            min_sep_x = min(bw, bw2) // 2
-            min_sep_y = min(bh, bh2) // 2
-            if abs(x - x2) < min_sep_x and abs(y - y2) < min_sep_y:
-                too_close = True
+            if not _texture_ok(features, x, y, box):
+                continue
+            sector = int((math.atan2(y+box/2-cy, x+box/2-cx) + math.pi) * 4 / math.pi) % 8
+            buckets[sector].append((float(fine[y:y+box, x:x+box].std()), x, y))
+    for bucket in buckets:
+        bucket.sort(reverse=True)
+    selected = []
+    while any(buckets) and len(selected) < count:
+        for bucket in buckets:
+            while bucket:
+                _, x, y = bucket.pop(0)
+                if all(abs(x-x2) >= box * .75 or abs(y-y2) >= box * .75 for x2, y2 in selected):
+                    selected.append((x, y))
+                    break
+            if len(selected) >= count:
                 break
-        if not too_close:
-            picked.append((sc, x, y, bw, bh))
-        if len(picked) >= k:
-            break
-    return picked
+    return selected
+
+
+def _consensus(vectors, centers, scores, cx, cy, radius, min_inliers):
+    vectors, centers, scores = map(np.asarray, (vectors, centers, scores))
+    if len(vectors) < min_inliers:
+        return None, '可靠纹理块不足', None
+    middle = np.median(vectors, axis=0)
+    residuals = np.linalg.norm(vectors - middle, axis=1)
+    keep = residuals <= .65
+    if keep.sum() < min_inliers or keep.mean() < .75:
+        return None, '局部位移不一致，可能有形变或误匹配', keep
+    locations = centers[keep]
+    quadrants = (locations[:, 0] >= cx).astype(int) + 2 * (locations[:, 1] >= cy).astype(int)
+    if (len(np.unique(quadrants)) < 3 or np.ptp(locations[:, 0]) < radius * .6
+            or np.ptp(locations[:, 1]) < radius * .6):
+        return None, '有效纹理集中在一侧，空间覆盖不足', keep
+    displacement = np.average(vectors[keep], axis=0, weights=np.maximum(scores[keep], .01)**2)
+    return displacement, '', keep
+
 
 def refine_alignment_multi_roi(
-    ref_gray, tgt_gray, cx, cy, r,
-    n_rois=16, roi_size=128, search=12,
-    base_shift=None, max_refine_delta_px=6.0, min_inliers=6, min_mean_zncc=0.55,
-    use_phasecorr=True, use_ecc=False,
-    time_budget_sec=1.2,
-    debug_cb=None
+    ref_gray, tgt_gray, cx, cy, r, n_rois=16, roi_size=128, search=12,
+    base_shift=None, max_refine_delta_px=6.0, min_inliers=6, min_mean_zncc=.65,
+    use_phasecorr=True, use_ecc=False, time_budget_sec=None, debug_cb=None,
+    diagnostics=None,
 ):
+    """Unified two-scale ZNCC + checked phase refinement, with safe rejection.
+
+    Inputs are already limb-aligned. Return a target-to-reference correction
+    matrix, mean accepted ZNCC, inlier count, and zero rotation. Rejection returns
+    the residual baseline and zero quality. Legacy time_budget_sec is ignored:
+    bounded ROI count, not machine speed, determines the evidence used.
     """
-    输入：已做圆心粗配准的 ref_gray / tgt_gray，以及参考圆心(cx,cy)与半径 r
-    输出：(M2x3, score, n_inliers, theta_deg)
-    特性：
-      • 仅估计残余平移（无旋转、无缩放）
-      • ROI 只在局部窗口内做匹配，避免全图卷积导致卡顿
-      • 内置时间预算，个别困难帧自动提前结束并回退上层策略
-      • 过滤过暗/低纹理 ROI，提升稳健性
-      • 当 refine 结果偏离过大或质量较低时，回退到霍夫基线 (base_shift)
-    失败：返回 (None, 0.0, 0, 0.0)
-    """
-    H, W = ref_gray.shape
-    _dbg(f"[Refine] HxW={H}x{W}, r≈{r:.1f}, n_rois={n_rois}, roi_init={roi_size}, search={search}", debug_cb)
-    _dbg("[Refine] 使用盘内纹理 ROI；不使用绝对亮度门控", debug_cb)
+    info = diagnostics if diagnostics is not None else {}
+    info.clear()
+    info.update(accepted=False, reason='', candidates=0, matched=0, inliers=0,
+                phase_used=0, correction=[0., 0.], algorithm='texture-consensus-v2')
+    baseline = np.asarray(base_shift if base_shift is not None else (0., 0.), dtype=float)
+    if baseline.shape != (2,) or not np.isfinite(baseline).all():
+        raise ValueError('无效的微调回退位移')
 
-    # 软盘遮罩，仅保留月盘内纹理
-    mask = _soft_disk_mask(H, W, cx, cy, r, inner=0.0, outer=0.97)
+    def finish(correction, reason='', score=0., count=0):
+        info.update(accepted=not bool(reason), reason=reason,
+                    correction=np.asarray(correction).tolist())
+        if debug_cb is not None:
+            debug_cb('[纹理微调] ' + (f'采用 correction=({correction[0]:.3f}, {correction[1]:.3f})px'
+                                     if not reason else '保留月缘结果：' + reason))
+        matrix = np.float32([[1, 0, correction[0]], [0, 1, correction[1]]])
+        return matrix, float(score), int(count), 0.
 
-    # 归一化转为8-bit，用于能量图和ROI选择
-    ref_gray_8u = ref_gray
-    if ref_gray.dtype != np.uint8:
-        ref_gray_8u = cv2.normalize(ref_gray.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    tgt_gray_8u = tgt_gray
-    if tgt_gray.dtype != np.uint8:
-        tgt_gray_8u = cv2.normalize(tgt_gray.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # 梯度/DoG 预处理（抗亮度变化），用于匹配阶段
-    refF = _clahe_and_bandpass(ref_gray)
-    tgtF = _clahe_and_bandpass(tgt_gray)
-
-    # 只保留盘内
-    refF = (refF.astype(np.float32) * mask).astype(np.uint8)
-    tgtF = (tgtF.astype(np.float32) * mask).astype(np.uint8)
-
-    # 能量图直接用高频响应（仅保留高频，避免中频干扰）
-    energy = cv2.GaussianBlur(refF, (0, 0), 1.2)
-
-    # 自适应/裁剪 ROI 数量与大小，避免过多卷积
-    n_rois = int(np.clip(n_rois if n_rois else (r/70), 8, 24))
-    roi_size = int(np.clip(roi_size if roi_size else (r*0.12), 64, 128))
-    search = int(np.clip(search if search else (r*0.05), 6, 18))
-
-    # 月食阶段亮度可跨很大范围；只依据盘内高频纹理选块，不以绝对灰度排除 ROI。
-    rois = _select_rois(energy, mask, r, k=n_rois, box=roi_size)
-    _dbg(f"[Refine] ROI候选数={len(rois)}", debug_cb)
-    sizes = [bw for (_sc, _x, _y, bw, bh) in rois]
-    if sizes:
-        _dbg(f"[Refine] 自适应ROI统计: 平均={np.mean(sizes):.0f}, 最小={np.min(sizes)}, 最大={np.max(sizes)}", debug_cb)
-    if not rois:
-        return None, 0.0, 0, 0.0
-
-    # 收集 ROI 局部位移向量（dx_i, dy_i）及其中心（xi, yi）
-    centers = []
-    zncc_list = []
-    dx_list, dy_list, weights = [], [], []
-
-    t_start = time.perf_counter()
-
-    for sc, x, y, bw, bh in rois:
-        # 时间预算：超时则提前结束，防止个别难帧拖慢
-        if time.perf_counter() - t_start > time_budget_sec:
-            break
-
-        ref_patch = refF[y:y + bh, x:x + bw]
-
-        # —— 过滤过暗/低纹理 ROI（避免落在阴影/背景）——
-        m = float(ref_patch.mean()); s = float(ref_patch.std())
-        if m < 8.0 or s < 6.0:   # 可按画面调节
-            _dbg(f"[Refine] 丢弃ROI: 过暗/低纹理 mean={m:.1f}, std={s:.1f}", debug_cb)
+    if use_ecc:
+        raise ValueError('不支持 ECC；实验分支已统一为双尺度纹理一致性微调')
+    if ref_gray.shape != tgt_gray.shape or ref_gray.ndim != 2:
+        return finish(baseline, '参考图和目标图尺寸不一致')
+    if not np.isfinite([cx, cy, r]).all() or r <= 0:
+        return finish(baseline, '月盘几何参数无效')
+    ref, tgt = _prepare(ref_gray), _prepare(tgt_gray)
+    if ref is None or tgt is None:
+        return finish(baseline, '图像无有效动态范围')
+    box = int(np.clip(roi_size, 48, 128))
+    search = int(np.clip(search, 6, 18))
+    rois = _select_rois(ref, cx, cy, r, box, int(np.clip(n_rois, 8, 24)), search)
+    info['candidates'] = len(rois)
+    vectors, centers, scores, coarse_vectors = [], [], [], []
+    window = cv2.createHanningWindow((box, box), cv2.CV_32F)
+    for x, y in rois:
+        ref_patch = ref[0][y:y+box, x:x+box]
+        dx, dy, score = _match_roi_zncc_local(ref_patch, tgt[0], x, y, search)
+        if score < min_mean_zncc or not _texture_ok(tgt, x+dx, y+dy, box):
             continue
-
-        # 几何月盘遮罩，而非绝对亮度遮罩：阴影中的有效地形不应被误删。
-        mask_patch = (mask[y:y + bh, x:x + bw] > 0.5).astype(np.uint8) * 255
-        if mask_patch.size > 0:
-            mask_patch = cv2.erode(mask_patch, np.ones((3,3), np.uint8), iterations=1)
-
-        dx, dy, zncc = _match_roi_zncc_local(ref_patch, tgtF, x, y, search=search, mask_patch=mask_patch)
-        if zncc < 0.28:
-            _dbg(f"[Refine] 丢弃ROI: ZNCC过低 zncc={zncc:.2f}", debug_cb)
+        dcx, dcy, coarse_score = _match_roi_zncc_local(ref[1][y:y+box, x:x+box], tgt[1], x, y, search)
+        if coarse_score < min_mean_zncc or math.hypot(dx-dcx, dy-dcy) > .6:
             continue
-
-        # 丢弃命中搜索边界的解，通常是含糊/假峰
-        if (abs(dx) >= (search - 0.5)) or (abs(dy) >= (search - 0.5)):
-            _dbg(f"[Refine] 丢弃ROI: 命中搜索边界 dx={dx:.2f}, dy={dy:.2f}", debug_cb)
-            continue
-
-        # 可选：相位相关做亚像素微调（仅在纹理足够时启用）
+        # Phase response is a separate gate, NEVER interchangeable with ZNCC.
         if use_phasecorr:
-            h, w = ref_patch.shape
-            # ZNCC 已给出整数峰值；在该峰值位置取同尺寸目标块，再仅估计
-            # 亚像素残差，不能从原始位置重复估计整段位移。
-            xp = int(round(x + dx))
-            yp = int(round(y + dy))
-            xe = min(tgtF.shape[1], xp + w)
-            ye = min(tgtF.shape[0], yp + h)
-            tgt_patch = tgtF[yp:ye, xp:xe]
-            if tgt_patch.shape == ref_patch.shape:
-                rp = ref_patch.astype(np.float32)
-                tp = tgt_patch.astype(np.float32)
-                if mask_patch is not None and mask_patch.shape == ref_patch.shape:
-                    m = (mask_patch.astype(np.float32) / 255.0)
-                    rp = rp * m
-                    tp = tp * m
-                    # 纹理/有效面积检查
-                    eff = rp[m > 0.5]
-                    if eff.size == 0 or np.std(eff) < 1e-3:
-                        tgt_patch = None
-                if tgt_patch is not None:
-                    (dx2, dy2), resp = cv2.phaseCorrelate(rp, tp)
-                    if (zncc >= 0.60) and (resp is not None) and np.isfinite(resp) and (resp > 0.20) and (abs(dx2) < 2.5) and (abs(dy2) < 2.5):
-                        dx += dx2; dy += dy2
-                        zncc = max(zncc, float(resp))
+            ix, iy = int(round(dx)), int(round(dy))
+            tp = _patch(tgt[0], x+ix, y+iy, box, box)
+            if tp is not None:
+                rp = np.ascontiguousarray(ref_patch - ref_patch.mean())
+                tp = np.ascontiguousarray(tp - tp.mean())
+                (px, py), response = cv2.phaseCorrelate(rp, tp, window.copy())
+                if (np.isfinite([px, py, response]).all() and response >= .3
+                        and abs(px) <= 1. and abs(py) <= 1.):
+                    phase_shift = np.array([ix+px, iy+py])
+                    if np.linalg.norm(phase_shift - [dcx, dcy]) <= .6:
+                        phase_patch = _patch(tgt[0], x+phase_shift[0], y+phase_shift[1], box, box)
+                        template_patch = _patch(tgt[0], x+dx, y+dy, box, box)
+                        if (phase_patch is not None and template_patch is not None
+                                and _zncc(ref_patch, phase_patch) >= _zncc(ref_patch, template_patch)):
+                            dx, dy = phase_shift
+                            info['phase_used'] += 1
+        matched = _patch(tgt[0], x+dx, y+dy, box, box)
+        if matched is None:
+            continue
+        # Reciprocity: the matched target patch must return to this location.
+        back_x, back_y, back_score = _match_roi_zncc_local(matched, ref[0], x, y, search)
+        if back_score < min_mean_zncc or math.hypot(back_x, back_y) > .5:
+            continue
+        score = _zncc(ref_patch, matched)
+        if score < min_mean_zncc:
+            continue
+        vectors.append((dx, dy))
+        coarse_vectors.append((dcx, dcy))
+        centers.append((x+box/2, y+box/2))
+        scores.append(score)
 
-        centers.append((x + bw / 2.0, y + bh / 2.0))
-        dx_list.append(float(dx))
-        dy_list.append(float(dy))
-        # 结合对比度作为权重，弱纹理权重低
-        weights.append(float(max(1e-3, zncc) * (0.5 + 0.5*np.clip(s/20.0, 0.0, 1.0))))
-        zncc_list.append(float(zncc))
-        _dbg(f"[Refine] 采纳ROI: zncc={zncc:.2f}, dx={dx:.2f}, dy={dy:.2f}", debug_cb)
-
-    n = len(centers)
-    _dbg(f"[Refine] 参与拟合的ROI数={n}", debug_cb)
-    if n < 3:
-        # Not enough ROIs; if baseline (Hough) is provided, fall back to it
-        if base_shift is not None:
-            tx_h, ty_h = float(base_shift[0]), float(base_shift[1])
-            M_h = np.array([[1.0, 0.0, tx_h],
-                            [0.0, 1.0, ty_h]], dtype=np.float32)
-            _dbg(f"[Refine] ROI不足，回退粗对齐残差: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
-            return M_h, 0.0, 0, 0.0
-        return None, 0.0, 0, 0.0
-
-    centers = np.asarray(centers, dtype=np.float64)
-    dx_arr = np.asarray(dx_list, dtype=np.float64)
-    dy_arr = np.asarray(dy_list, dtype=np.float64)
-    w_arr  = np.asarray(weights, dtype=np.float64)
-
-    zncc_arr = np.asarray(zncc_list, dtype=np.float64) if len(zncc_list) else np.array([], dtype=np.float64)
-    mean_zncc = float(zncc_arr.mean()) if zncc_arr.size else 0.0
-
-    # —— 仅估计平移（无旋转），使用Tukey双权IRLS（单帧内稳健，无跨帧约束）——
-    medx = np.median(dx_arr)
-    medy = np.median(dy_arr)
-    resid = np.hypot(dx_arr - medx, dy_arr - medy)
-    mad = np.median(np.abs(resid - np.median(resid))) + 1e-6
-    sigma = 1.4826 * mad + 1e-6
-    c = 4.685 * sigma  # Tukey截止
-
-    # 初始权（来自匹配质量）
-    base_w = np.clip(w_arr, 1e-6, None)
-
-    # 一次IRLS即可（经验上已足够稳健）
-    r = np.hypot(dx_arr - medx, dy_arr - medy)
-    tukey = np.zeros_like(r)
-    m = r < c
-    rr = r[m] / (c + 1e-6)
-    tukey[m] = (1 - rr**2)**2
-
-    ww = base_w * tukey
-    if ww.sum() < 1e-6 or (tukey > 0).sum() < 3:
-        if base_shift is not None:
-            tx_h, ty_h = float(base_shift[0]), float(base_shift[1])
-            M_h = np.array([[1.0, 0.0, tx_h],
-                            [0.0, 1.0, ty_h]], dtype=np.float32)
-            _dbg(f"[Refine] IRLS失败，回退粗对齐残差: shift=({tx_h:.2f},{ty_h:.2f})", debug_cb)
-            return M_h, 0.0, 0, 0.0
-        return None, 0.0, 0, 0.0
-
-    tx = float(np.average(dx_arr, weights=ww))
-    ty = float(np.average(dy_arr, weights=ww))
-
-    cnt = int((tukey > 0).sum())
-    score = float((cnt / float(n)) * (ww.max() / (base_w.max() + 1e-6)))
-
-    # --- Quality gate & baseline fallback (no inter-frame constraint) ---
-    if base_shift is not None:
-        dx_h, dy_h = float(base_shift[0]), float(base_shift[1])
-        delta = math.hypot(tx - dx_h, ty - dy_h)
-        bad = False
-        reasons = []
-        if cnt < int(min_inliers):
-            bad = True
-            reasons.append(f"inliers={cnt}<{int(min_inliers)}")
-        if mean_zncc < float(min_mean_zncc):
-            bad = True
-            reasons.append(f"mean_zncc={mean_zncc:.2f}<{float(min_mean_zncc):.2f}")
-        if delta > float(max_refine_delta_px):
-            bad = True
-            reasons.append(f"|refine-hough|={delta:.2f}px>{float(max_refine_delta_px):.2f}")
-        if bad:
-            # Fall back to the residual baseline (normally identity after coarse alignment).
-            tx, ty = dx_h, dy_h
-            _dbg("[Refine] 触发门控，回退粗对齐残差: " + "; ".join(reasons) + f" -> ({tx:.2f},{ty:.2f})", debug_cb)
-
-    # 最终 2x3 仿射矩阵（仅平移）
-    M = np.array([[1.0, 0.0, tx],
-                  [0.0, 1.0, ty]], dtype=np.float32)
-
-    theta_deg = 0.0
-    _dbg(f"[Refine] 内点={cnt}/{n}, 平移=({tx:.2f},{ty:.2f}), meanZNCC={mean_zncc:.2f}, score={score:.3f}", debug_cb)
-    return M, score, int(cnt), theta_deg
+    info['matched'] = len(vectors)
+    displacement, reason, keep = _consensus(vectors, centers, scores, cx, cy, r, min_inliers)
+    info['inliers'] = int(keep.sum()) if keep is not None else 0
+    if reason:
+        return finish(baseline, reason)
+    coarse_shift, coarse_reason, _ = _consensus(coarse_vectors, centers, scores, cx, cy, r, min_inliers)
+    if coarse_reason or np.linalg.norm(coarse_shift-displacement) > .35:
+        return finish(baseline, '双尺度位移不一致')
+    correction = -displacement  # Target displacement is NOT a target warp.
+    if np.linalg.norm(correction-baseline) > max_refine_delta_px:
+        return finish(baseline, '微调超过允许范围')
+    info['spread_px'] = float(np.max(np.linalg.norm(np.asarray(vectors)[keep]-displacement, axis=1)))
+    info['mean_zncc'] = float(np.mean(np.asarray(scores)[keep]))
+    return finish(correction, score=info['mean_zncc'], count=info['inliers'])

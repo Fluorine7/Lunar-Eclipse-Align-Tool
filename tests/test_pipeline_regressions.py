@@ -9,6 +9,7 @@ import numpy as np
 
 import algorithms_circle
 import pipeline
+from algorithms_independent import Analysis, Geometry
 from algorithms_limb import detect_faint_lunar_disk
 
 
@@ -20,23 +21,27 @@ class PipelineRegressions(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             def mock(name, **kwargs):
                 return stack.enter_context(patch.object(pipeline, name, **kwargs))
-            stack.enter_context(patch.object(pipeline.os.path, "exists", return_value=True))
+            stack.enter_context(patch.object(pipeline.os.path, "exists", return_value=False))
+            stack.enter_context(patch.object(pipeline.os.path, "isfile", return_value=True))
             stack.enter_context(patch.object(pipeline.os, "listdir", return_value=[filename]))
             mock("ensure_dir_exists", return_value=True)
             mock("log")
-            mock("imread_unicode", side_effect=lambda path, *a: reference if path == "/outside/same.tif" else target)
-            mock("_detect_circle_on_thumb", return_value=(True, (32, 32, 20), 1, 90, "test"))
-            ellipse = ((32, 27.3, 19.9), 0.3, 0.49, 300, (1/400, 0, 1/400), True)
-            mock("refine_lunar_limb_elliptical", side_effect=[None, ellipse] if ellipse_target else None, return_value=None)
-            detect = mock("detect_circle_phd2_enhanced", return_value=((32, 32, 20) if ellipse_target else None, target, 0, "test", "dark"))
-            faint = mock("detect_faint_lunar_disk", return_value=((32, 32, 20), 20, "test") if rescue else None)
+            fit = Geometry((32., 32.), 20., (20., 20.), 0., 'circle', .2, .8, 200, .2)
+            reference_result = Analysis(fit, 'reference', {})
+            mock('_reference', return_value=('/outside/same.tif', reference, reference_result))
+            mock('choose_analysis_workers', return_value=1)
+            mock('_write_reports')
+            mock('imread_unicode', return_value=target)
+            target_fit = Geometry((32., 32.), 20., (20., 20.), 0., 'circle', .2, .8, 200, .2,
+                                  ['模型圆心分歧'] if ellipse_target else []) if rescue else None
+            detect = mock('analyze_lunar_frame', return_value=Analysis(target_fit, 'independent', {}, '无可靠月缘'))
             saved = []
             mock("imwrite_with_exif", side_effect=lambda src, dst, image: saved.append(image.copy()) or True)
             pipeline.align_moon_images_incremental(
                 "/input", "/output", (10, 30, 50, 20),
                 reference_image_path="/outside/same.tif",
             )
-            return detect.call_count, faint.call_count, saved, target
+            return detect.call_count, detect.call_count, saved, target
 
     def test_external_reference_with_same_name_does_not_replace_target(self):
         detected, rescued, saved, target = self.run_pipeline(collision=True)
@@ -45,7 +50,7 @@ class PipelineRegressions(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         np.testing.assert_array_equal(saved[0], target)
 
-    def test_initial_detection_failure_can_be_rescued(self):
+    def test_independently_validated_frame_is_written(self):
         _, rescued, saved, _ = self.run_pipeline()
         self.assertEqual(rescued, 1)
         self.assertEqual(len(saved), 1)
@@ -55,12 +60,10 @@ class PipelineRegressions(unittest.TestCase):
         self.assertEqual(rescued, 1)
         self.assertEqual(saved, [])
 
-    def test_plausible_ellipse_radius_does_not_bypass_center_check(self):
-        # Radius differs by only 0.5%, but the center is displaced by 4.7 px.
+    def test_uncertain_ellipse_is_not_written_as_success(self):
         _, checked, saved, target = self.run_pipeline(ellipse_target=True)
         self.assertEqual(checked, 1)
-        self.assertEqual(len(saved), 1)
-        np.testing.assert_array_equal(saved[0], target)
+        self.assertEqual(saved, [])
 
     def test_detection_does_not_depend_on_elapsed_time(self):
         image = np.zeros((240, 240), np.uint8)

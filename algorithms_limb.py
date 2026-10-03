@@ -8,6 +8,7 @@ surface texture matching.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -130,6 +131,17 @@ def detect_faint_lunar_disk(
     )
 
 
+@lru_cache(maxsize=8)
+def _background_design(height: int, width: int) -> np.ndarray:
+    """Immutable coordinate template only; never cache fitted image data."""
+    yy, xx = np.mgrid[0:height, 0:width]
+    x = (xx.ravel() - .5 * (width - 1)) / max(width, 1)
+    y = (yy.ravel() - .5 * (height - 1)) / max(height, 1)
+    design = np.column_stack((np.ones(x.size), x, y, x*x, x*y, y*y))
+    design.setflags(write=False)
+    return design
+
+
 def _remove_smooth_background(channel: np.ndarray) -> np.ndarray:
     """Robustly subtract a quadratic sky/background surface."""
     height, width = channel.shape
@@ -141,10 +153,7 @@ def _remove_smooth_background(channel: np.ndarray) -> np.ndarray:
     else:
         fit_image = channel
     fit_h, fit_w = fit_image.shape
-    yy, xx = np.mgrid[0:fit_h, 0:fit_w]
-    x = (xx.ravel() - 0.5 * (fit_w - 1)) / max(fit_w, 1)
-    y = (yy.ravel() - 0.5 * (fit_h - 1)) / max(fit_h, 1)
-    design = np.column_stack((np.ones(x.size), x, y, x * x, x * y, y * y))
+    design = _background_design(fit_h, fit_w)
     values = fit_image.reshape(-1).astype(np.float64)
     keep = np.ones(values.size, dtype=bool)
     coefficients = None
@@ -162,7 +171,7 @@ def _remove_smooth_background(channel: np.ndarray) -> np.ndarray:
             break
         keep = new_keep
 
-    full_y, full_x = np.mgrid[0:height, 0:width]
+    full_y, full_x = np.ogrid[0:height, 0:width]
     full_x = (full_x - 0.5 * (width - 1)) / max(width, 1)
     full_y = (full_y - 0.5 * (height - 1)) / max(height, 1)
     background = (

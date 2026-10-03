@@ -320,6 +320,10 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
     返回: (best_circle [cx, cy, r], processed_gray, quality, method_str, brightness_mode)
     失败: (None, processed_or_input_gray, 0, 'error', 'unknown')
     """
+    if prev_circle is not None:
+        raise ValueError("Previous-frame geometry is not supported; detect each image independently.")
+    if not (np.isfinite(min_radius) and np.isfinite(max_radius) and 0 < min_radius < max_radius):
+        raise ValueError("Radius bounds must be finite and satisfy 0 < min < max.")
     try:
         processed, brightness_mode = adaptive_preprocessing(image, "auto")
         # 可选：强力降噪（仅影响检测，不影响最终成片）
@@ -513,6 +517,8 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
             if best_circle is not None:
                 rr = float(best_circle[2])
                 if not (float(min_radius) <= rr <= float(max_radius)):
+                    # Never retain an invalid candidate when the retry fails.
+                    best_circle, best_score, detection_method = None, 0.0, "radius-out-of-bounds"
                     # 在严格窗口内再做一次快速霍夫重试
                     height, width = processed_det.shape
                     _minDist_coreS = max(16, min(height, width) // 4)
@@ -535,6 +541,12 @@ def detect_circle_phd2_enhanced(image, min_radius, max_radius, param1, param2, s
                             detection_method = f"{detection_method}|strict-window"
         except Exception:
             pass
+
+        if best_circle is not None and (
+            not np.all(np.isfinite(best_circle))
+            or not float(min_radius) <= float(best_circle[2]) <= float(max_radius)
+        ):
+            best_circle, best_score, detection_method = None, 0.0, "invalid-circle"
 
         return best_circle, processed, best_score, detection_method, brightness_mode
 

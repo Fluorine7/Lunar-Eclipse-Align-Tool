@@ -1,8 +1,10 @@
 __pycache__/
 *.py[cod]
-.venv/
+.venv*/
 build/
 dist/
 *.spec
-*_aligned_V*/
+sample_da/
+*_aligned*/
+UMBRA_HANDOFF.md
 .DS_Store

@@ -905,7 +905,7 @@ class UniversalLunarAlignApp:
         self._create_param_widgets(); self._create_imppg_widgets()
         self._create_debug_widgets(); self._create_action_widgets()
         self._create_log_widgets(); self._set_initial_log_message()
-        self.on_debug_mode_change(); self.on_advanced_change()
+        self.on_debug_mode_change()
 
     def setup_cross_platform(self):
         try:
@@ -932,9 +932,9 @@ class UniversalLunarAlignApp:
             "param2": tk.IntVar(value=30)
         }
         self.use_advanced_alignment = tk.BooleanVar(value=False)
-        self.alignment_method = tk.StringVar(value="auto")
         # 新增：强力降噪（仅用于检测/对齐，不影响输出）
         self.enable_strong_denoise = tk.BooleanVar(value=False)
+        self.analysis_workers = tk.StringVar(value="自动")
 
     def _create_main_layout(self):
         self.root.columnconfigure(0, weight=1); self.root.rowconfigure(2, weight=1)
@@ -981,32 +981,33 @@ class UniversalLunarAlignApp:
 
     def _create_param_widgets(self):
         f = self.param_frame; f.columnconfigure(1, weight=1)
-        help_text = ("• 霍夫圆检测结合外缘精定位，用于确定月面圆心\n"
+        help_text = ("• 预览用于半径初估；正式处理独立验证本帧月缘\n"
                      "• 最小/最大半径: 限制检测到的圆的半径范围(像素)\n"
                      "• 参数1: Canny边缘检测高阈值\n"
                      "• 参数2: 霍夫累加器阈值（关键参数）")
         ttk.Label(f, text=help_text, justify="left", font=(UI_FONT[0], UI_FONT[1]-1)).grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=(0,10))
-        defs = [("min_radius","最小半径:",1,3000),("max_radius","最大半径:",10,4000),("param1","参数1 (Canny):",1,200),("param2","参数2 (累加阈值):",1,100)]
+        defs = [("min_radius","最小半径:",9,3000),("max_radius","最大半径:",10,4000),("param1","参数1 (Canny):",1,200),("param2","参数2 (累加阈值):",1,100)]
         for i,(k,label,a,b) in enumerate(defs):
             var = self.params[k]; r = i+1
             ttk.Label(f, text=label, font=UI_FONT).grid(row=r, column=0, sticky="w", padx=5, pady=3)
             ttk.Scale(f, from_=a, to_=b, orient="horizontal", variable=var,
                       command=lambda v, kk=k: self.params[kk].set(int(float(v)))).grid(row=r, column=1, sticky="ew", padx=5, pady=3)
             ttk.Spinbox(f, from_=a, to_=b, textvariable=var, width=6, font=UI_FONT).grid(row=r, column=2, padx=5, pady=3)
+        ttk.Label(f, text="分析并行:", font=UI_FONT).grid(row=5, column=0, sticky="w", padx=5, pady=3)
+        ttk.Combobox(f, textvariable=self.analysis_workers, values=["自动", "1", "2", "4"],
+                     state="readonly", width=8).grid(row=5, column=1, sticky="w", padx=5, pady=3)
+        ttk.Label(f, text="逐帧独立；自动按 CPU/内存选择 1–2 路", font=(UI_FONT[0], UI_FONT[1]-2)).grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=5, pady=3)
 
     def _create_imppg_widgets(self):
         f = self.imppg_frame
         ttk.Checkbutton(f, text="启用实验性月面纹理微调（仅平移）", variable=self.use_advanced_alignment,
-                        command=self.on_advanced_change).pack(fill="x", padx=5, pady=(0,10))
-        ttk.Label(f, text="实验选项:", font=UI_FONT).pack(anchor="w", padx=5)
-        self.method_combo = ttk.Combobox(f, textvariable=self.alignment_method,
-                                         values=['auto','phase_corr','template','feature','centroid'],
-                                         state="disabled", width=15, font=UI_FONT)
-        self.method_combo.pack(fill="x", padx=5, pady=2)
+                        ).pack(fill="x", padx=5, pady=(0,10))
         # 文案替换：算法帮助
-        algo_help = ("• 在月盘内选择纹理区域，尝试对圆心结果做小幅平移微调\n"
-                     "• 受视宁、拖影、果冻效应及曝光变化影响，结果可能不稳定\n"
-                     "• 当前为实验功能；正式处理建议保持关闭")
+        algo_help = ("• 统一使用双尺度纹理匹配与相位残差校验\n"
+                     "• 多区域位移不一致、纹理不足时保留月缘结果\n"
+                     "• 每张图独立对照参考图，不沿用上一帧位置\n"
+                     "• 无法消除局部视宁形变；默认关闭，建议先小批量测试")
         ttk.Label(f, text=algo_help, justify="left",
                   font=(UI_FONT[0], UI_FONT[1]-2), foreground="darkgreen").pack(anchor="w", padx=5, pady=(5,10))
         ttk.Label(f, text="⚠️ 实验性功能：默认关闭，不纳入常规对齐流程", font=(UI_FONT[0], UI_FONT[1]-1),
@@ -1056,9 +1057,6 @@ class UniversalLunarAlignApp:
         self.debug_window.lift()
         self.debug_window.focus_force()
 
-    def on_advanced_change(self):
-        self.method_combo.config(state="readonly" if self.use_advanced_alignment.get() else "disabled")
-
     def _create_action_widgets(self):
         f = self.action_frame; f.columnconfigure(0, weight=1)
         
@@ -1094,8 +1092,8 @@ class UniversalLunarAlignApp:
                    f"SciPy状态: {scipy_status}\n"
                    "================================================================\n\n"
                    "算法说明：\n"
-                   "• 常规流程：霍夫初定位 + 受约束椭圆/稳健圆外缘精定位\n"
-                   "• 每张目标图独立求圆心；短月缘使用参考图半径约束\n"
+                   "• 常规流程：霍夫初定位 + 连续圆/椭圆模型月缘精定位\n"
+                   "• 每张目标图独立求圆心与浮动半径，不借用其他帧几何\n"
                    "• 极暗月面会自动尝试背景校正与双通道环积分回退\n"
                    "• 实验性月面纹理微调：默认关闭，不建议用于常规处理\n"
                    "• 不进行图像缩放或旋转\n\n"
@@ -1104,8 +1102,7 @@ class UniversalLunarAlignApp:
                    "• 参数2（累加器阈值）是最关键的调整参数\n"
                    f"• 支持格式：{', '.join(SUPPORTED_EXTS)}\n")
         if not SCIPY_AVAILABLE:
-            welcome += ("\n⚠️ 注意: SciPy未安装，相位相关算法将被禁用\n"
-                        "可通过 pip install scipy 安装以启用实验性纹理微调中的相位相关增强\n")
+            welcome += ("\n⚠️ 注意: 常规月缘拟合需要 SciPy，请安装 requirements.txt 中的依赖。\n")
         self.log_box.insert(tk.END, welcome); self.log_box.config(state="disabled")
 
     # —— 选择/打开等 UI 行为（保持原文案） ——
@@ -1162,10 +1159,6 @@ class UniversalLunarAlignApp:
             messagebox.showerror("错误", "请指定输出文件夹。"); return
 
         use_advanced = self.use_advanced_alignment.get()
-        method = self.alignment_method.get()
-        if use_advanced and not SCIPY_AVAILABLE and method in ['auto','phase_corr']:
-            ok = messagebox.askyesno("警告","SciPy未安装，相位相关算法将被禁用。\n实验性月面纹理微调的效果可能受限。\n\n是否继续？", icon='warning')
-            if not ok: return
 
         ref_path = self.reference_image_var.get().strip() or None
         ref_path = normalize_path(ref_path) if ref_path else None
@@ -1208,7 +1201,9 @@ class UniversalLunarAlignApp:
             target=align_moon_images_incremental,
             args=(in_path, out_path, hough_params, self.log_box, dbg_mode, dbg_basename,
                   self.on_alignment_complete, progress_callback, ref_path,
-                  use_advanced, method, bool(self.enable_strong_denoise.get())),
+                  use_advanced),
+            kwargs={"strong_denoise": bool(self.enable_strong_denoise.get()),
+                    "workers": None if self.analysis_workers.get() == "自动" else int(self.analysis_workers.get())},
             daemon=True
         ).start()
 
@@ -1220,7 +1215,9 @@ class UniversalLunarAlignApp:
         self.log_box.config(state="disabled")
         if self.progress_window and self.progress_window.winfo_exists():
             self.progress_window.destroy(); self.progress_window = None
-        if success: messagebox.showinfo("处理完成", message)
+        if success and '请查看 alignment-review.txt' in message:
+            messagebox.showwarning("已完成，需复查", message)
+        elif success: messagebox.showinfo("处理完成", message)
         else: messagebox.showerror("处理失败", "处理过程中发生错误，详情请查看日志。", detail=message)
 
     def show_about_author(self):
